@@ -1,0 +1,2 @@
+# qqcode patch: keep `cargo fmt --all` in the parent workspace from reformatting the vendored sources
+disable_all_formatting = true

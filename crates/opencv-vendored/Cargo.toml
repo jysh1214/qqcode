@@ -1,0 +1,9 @@
+[package]
+name = "opencv-vendored"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Builds the OpenCV checkout in third_party/ and tells dependants where it is"
+# `links` is what lets build.rs hand the install location to dependants as DEP_OPENCV_VENDORED_*
+links = "opencv_vendored"
+build = "build.rs"

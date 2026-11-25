@@ -1,0 +1,54 @@
+--- a/build/library.rs
++++ b/build/library.rs
+@@ -628,6 +628,17 @@
+ 	}
+ 
+ 	pub fn probe() -> Result<Self> {
++		// qqcode patch: use the OpenCV built by `opencv-vendored` and nothing else. Going through `probe_system()`
++		// would fall back to a system-wide OpenCV whenever the vendored one can't be used.
++		if let Ok(include_paths) = env::var("DEP_OPENCV_VENDORED_INCLUDE") {
++			let link_paths = env::var("DEP_OPENCV_VENDORED_LIB")?;
++			let link_libs = env::var("DEP_OPENCV_VENDORED_LIBS")?;
++			return Self::probe_from_paths(
++				Some(EnvList::from(include_paths.as_str())),
++				Some(EnvList::from(link_paths.as_str())),
++				Some(EnvList::from(link_libs.as_str())),
++			);
++		}
+ 		let include_paths = env::var("OPENCV_INCLUDE_PATHS").ok();
+ 		let include_paths = include_paths.as_deref().map(EnvList::from);
+ 		let link_paths = env::var("OPENCV_LINK_PATHS").ok();
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -215,6 +215,13 @@
+ xphoto = ["photo"]
+ xstereo = []
+ 
++# qqcode patch: with only a few modules enabled these fire in the crate's own sources, and as a path
++# dependency its warnings are not capped
++[lints.rust]
++unused_imports = "allow"
++unused_macros = "allow"
++unfulfilled_lint_expectations = "allow"
++
+ [lib]
+ name = "opencv"
+ path = "src/lib.rs"
+@@ -432,6 +439,12 @@
+ name = "videoio"
+ path = "tests/videoio.rs"
+ 
++# qqcode patch: OpenCV itself is compiled from third_party/opencv by `opencv-vendored`. Depending on it makes
++# cargo finish that build before this crate's build script runs and hands its location over as
++# `DEP_OPENCV_VENDORED_*`.
++[dependencies.opencv-vendored]
++path = "../../crates/opencv-vendored"
++
+ [dependencies.half]
+ version = "2"
+ optional = true
+--- a/rustfmt.toml
++++ b/rustfmt.toml
+@@ -0,0 +1,2 @@
++# qqcode patch: keep `cargo fmt --all` in the parent workspace from reformatting the vendored sources
++disable_all_formatting = true
