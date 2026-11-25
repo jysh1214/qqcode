@@ -1,0 +1,4 @@
+/target
+# OpenCV build tree and install prefix, produced by crates/opencv-vendored
+/third_party/_build
+/third_party/_install
