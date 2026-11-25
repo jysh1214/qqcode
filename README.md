@@ -42,18 +42,6 @@ The first build compiles OpenCV, which takes a minute or two; its log is
 The build does not notice a system update that replaces FFmpeg. If `qqcode` stops starting after one
 (`error while loading shared libraries: libavformat.so...`), delete those two directories and build again.
 
-### `qqcode-show` alone
-
-The machine that has the file is often the one on which little can be installed. `qqcode-show` is plain
-Rust, and there is a way to build it and nothing else:
-
-```sh
-cargo build --release --no-default-features
-```
-
-This takes no OpenCV, so no submodule, no cmake, no clang and no FFmpeg; the feature that is left out,
-`reader`, is the program `qqcode` with all that it needs.
-
 ### Environment variables
 
 Environment variables read by the OpenCV build:
@@ -224,4 +212,4 @@ file than the one being read make `qqcode` start over with that file.
 `cargo test` needs neither a camera nor a terminal: unit tests for the pure logic, the tests of
 `qqcode-show`, which have its screens drawn as images, photographed at an angle and out of focus and read
 back as the file, and `tests/pipeline.rs`, which does the same with single codes and runs the program
-`qqcode` on pictures. `cargo test --no-default-features` runs what remains without OpenCV.
+`qqcode` on pictures.

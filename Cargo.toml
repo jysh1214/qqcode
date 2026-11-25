@@ -14,17 +14,6 @@ publish = false
 default-run = "qqcode"
 description = "Carries a file from a screen to a camera as a sequence of QR codes"
 
-[features]
-default = ["reader"]
-# The program `qqcode`, which reads the codes from a camera, and with it OpenCV. Without this feature
-# (`--no-default-features`) the package is `qqcode-show` alone, which is plain Rust and builds anywhere.
-reader = ["dep:opencv", "dep:opencv-vendored", "dep:rxing"]
-
-[[bin]]
-name = "qqcode"
-path = "src/main.rs"
-required-features = ["reader"]
-
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -38,8 +27,8 @@ opencv = { path = "third_party/opencv-rust", default-features = false, features 
     "imgcodecs",
     "imgproc",
     "videoio",
-], optional = true }
-opencv-vendored = { path = "crates/opencv-vendored", optional = true }
+] }
+opencv-vendored = { path = "crates/opencv-vendored" }
 # makes the QR codes
 qrcode = { version = "0.15", default-features = false, features = ["std"] }
 # finds the QR codes in a frame and decodes them: of the many kinds of codes it reads, the QR reader alone
@@ -47,6 +36,6 @@ rxing = { version = "0.9", default-features = false, features = [
     "decoders",
     "encoding_rs",
     "qrcode",
-], optional = true }
+] }
 # how many terminal columns a piece of text takes
 unicode-width = "0.2"

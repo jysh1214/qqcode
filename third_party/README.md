@@ -30,9 +30,6 @@ no dependency that could build OpenCV for it. That is why a copy of the crate li
 
 The `docs/` directory of the published crate (pre-generated bindings for docs.rs, 16 MB) is left out.
 
-None of this is built without the cargo feature `reader` (`cargo build --no-default-features`), which
-leaves `qqcode-show` alone.
-
 ## Updating
 
 OpenCV: check out the new tag in the submodule. The next `cargo build` notices the new revision and rebuilds.

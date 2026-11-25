@@ -417,7 +417,6 @@ fn options_are_checked() {
 }
 
 /// What `qqcode` makes of the screens, as pictures of them.
-#[cfg(feature = "reader")]
 // a file may well be missing in one part only
 #[allow(clippy::single_range_in_vec_init)]
 mod camera {

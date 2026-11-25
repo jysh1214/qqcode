@@ -1,6 +1,5 @@
 //! End to end on synthetic frames: codes as `qqcode-show` makes them, seen at an angle, and the program
 //! `qqcode` on pictures of them.
-#![cfg(feature = "reader")]
 // a file may well be missing in one part only
 #![allow(clippy::single_range_in_vec_init)]
 
