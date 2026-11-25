@@ -13,7 +13,10 @@ use opencv::prelude::*;
 use opencv::{imgcodecs, imgproc};
 
 use qqcode::code::{self, Level};
+use qqcode::fountain::Encoder;
+use qqcode::packet::{Frame, OVERHEAD, Origin};
 use qqcode::protocol::{FileId, Message};
+use qqcode::tiles::{self, Grid};
 use qqcode::{Kind, Outcome, Pipeline, digest};
 
 const VERSION: usize = 12;
@@ -109,7 +112,7 @@ fn reads_a_show_from_its_start_screen_to_the_file() -> Result<()> {
         outcomes.push(pipeline.process(&frame(&message)?)?);
         if outcomes.len() == 1 {
             assert_eq!(pipeline.name(), Some("notes.bin"));
-            assert_eq!(pipeline.file(), FileId::of(&file));
+            assert_eq!(pipeline.file(), Some(Origin::of(&file)));
         }
     }
     let piece = |new| Outcome::Piece { new, skipped: 0 };
@@ -266,7 +269,7 @@ fn codes_of_another_file_start_over() -> Result<()> {
         Outcome::Piece { new: 228, skipped: 0 }
     );
     assert_eq!((pipeline.files(), pipeline.name()), (2, None));
-    assert_eq!(pipeline.file(), FileId::of(&second));
+    assert_eq!(pipeline.file(), Some(Origin::of(&second)));
     assert_eq!(pipeline.assembly().unwrap().missing(), [0..272]);
     assert_eq!(pipeline.process(&frame(&second_show[1])?)?, Outcome::Complete);
     assert_eq!(pipeline.take_file(), Some(second));
@@ -319,6 +322,199 @@ fn empty_file_is_whole_at_its_start_screen() -> Result<()> {
     let mut pipeline = Pipeline::new();
     assert_eq!(pipeline.process(&frame(&messages[0])?)?, Outcome::Complete);
     assert_eq!(pipeline.take_file(), Some(Vec::new()));
+    Ok(())
+}
+
+/// The matrix of the web page that these tests show: 128 by 72 tiles, 5265 bytes of a file in a frame.
+const GRID: Grid = Grid {
+    columns: 128,
+    rows: 72,
+};
+
+/// What the web page shows of `file`: its start screen, and after it the packets of the file without end.
+fn page_frame(file: &[u8], frame: Option<u64>) -> Frame {
+    let origin = Origin::of(file);
+    let encoder = Encoder::new(file, origin.checksum, GRID.capacity() - OVERHEAD);
+    match frame {
+        None => Frame::Start {
+            origin,
+            name: "notes.bin".to_owned(),
+        },
+        Some(frame) => {
+            let (block, sequence) = encoder.plan().turn(frame);
+            Frame::Packet {
+                origin,
+                block,
+                sequence,
+                bytes: encoder.packet(block, sequence),
+            }
+        }
+    }
+}
+
+/// A camera frame that shows the page with `frame` on it: the matrix on a light page, somewhat smaller
+/// than it is, a little turned and out of focus.
+fn page_seen(frame: &Frame) -> Result<Mat> {
+    let picture = tiles::render(GRID, &tiles::pack(GRID, &frame.encode(GRID.capacity())));
+    let size = Size::new(GRID.width() as i32, GRID.height() as i32);
+    let mut matrix = Mat::new_size_with_default(size, CV_8UC3, Scalar::all(0.0))?;
+    for (to, from) in matrix
+        .data_bytes_mut()?
+        .chunks_exact_mut(3)
+        .zip(picture.chunks_exact(3))
+    {
+        to.copy_from_slice(&[from[2], from[1], from[0]]);
+    }
+    let middle = Point2f::new(size.width as f32 / 2.0, size.height as f32 / 2.0);
+    let mut transform = imgproc::get_rotation_matrix_2d(middle, 1.5, 0.9)?;
+    *transform.at_2d_mut::<f64>(0, 2)? += 960.0 - middle.x as f64;
+    *transform.at_2d_mut::<f64>(1, 2)? += 540.0 - middle.y as f64;
+    let mut seen = Mat::default();
+    imgproc::warp_affine(
+        &matrix,
+        &mut seen,
+        &transform,
+        Size::new(1920, 1080),
+        imgproc::INTER_LINEAR,
+        core::BORDER_CONSTANT,
+        Scalar::all(240.0),
+    )?;
+    let mut blurred = Mat::default();
+    imgproc::gaussian_blur_def(&seen, &mut blurred, Size::new(0, 0), 1.0)?;
+    Ok(blurred)
+}
+
+/// Shows the reader a frame of the page of `file`.
+fn show_page(pipeline: &mut Pipeline, file: &[u8], frame: Option<u64>) -> Result<Outcome> {
+    pipeline.process(&page_seen(&page_frame(file, frame))?)
+}
+
+#[test]
+fn reads_a_web_page_from_its_start_screen_to_the_file() -> Result<()> {
+    let file = bytes(20_000, 11);
+    let mut pipeline = Pipeline::new();
+    assert_eq!(show_page(&mut pipeline, &file, None)?, Outcome::Ready);
+    assert_eq!(
+        show_page(&mut pipeline, &file, Some(0))?,
+        Outcome::Packet { new: true }
+    );
+    // the same frame again tells nothing new
+    assert_eq!(
+        show_page(&mut pipeline, &file, Some(0))?,
+        Outcome::Packet { new: false }
+    );
+    assert_eq!(
+        show_page(&mut pipeline, &file, Some(1))?,
+        Outcome::Packet { new: true }
+    );
+    assert_eq!(
+        show_page(&mut pipeline, &file, Some(2))?,
+        Outcome::Packet { new: true }
+    );
+    assert_eq!(pipeline.packets(), Some((3, 4)));
+    assert_eq!(pipeline.received(), Some(3 * 5265));
+    assert_eq!(
+        (pipeline.name(), pipeline.file()),
+        (Some("notes.bin"), Some(Origin::of(&file)))
+    );
+    assert!(pipeline.assembly().is_none());
+    let seen = pipeline.last_survey().codes[0].clone();
+    assert_eq!(
+        (seen.kind, seen.modules, seen.is_matrix()),
+        (Kind::Piece, 128, true)
+    );
+    // nine tenths of the 9 pixels that a tile has on the page
+    assert!((7.9..8.4).contains(&seen.module_size), "{}", seen.module_size);
+    assert_eq!(show_page(&mut pipeline, &file, Some(3))?, Outcome::Complete);
+    assert_eq!(pipeline.take_file().as_ref(), Some(&file));
+    // what the page shows after that is of a file that is whole
+    assert_eq!(show_page(&mut pipeline, &file, Some(9))?, Outcome::Complete);
+    assert_eq!(pipeline.received(), Some(20_000));
+    Ok(())
+}
+
+#[test]
+fn web_page_is_read_from_any_frames_that_are_enough() -> Result<()> {
+    let file = bytes(30_000, 12);
+    let mut pipeline = Pipeline::new();
+    // none of the six frames that are the file itself: sums of them only, from wherever the page is
+    let mut frames = 0;
+    for frame in 1000.. {
+        frames += 1;
+        match pipeline.process(&page_seen(&page_frame(&file, Some(frame)))?)? {
+            Outcome::Complete => break,
+            outcome => assert!(matches!(outcome, Outcome::Packet { .. }), "{outcome:?}"),
+        }
+        assert!(frames < 16, "the file never came together");
+    }
+    // Six frames that tell something new. Of a file this short most sums do and some don't: there are
+    // only 64 sums of six packets.
+    assert!((6..=12).contains(&frames), "{frames}");
+    assert_eq!(pipeline.take_file(), Some(file));
+    Ok(())
+}
+
+#[test]
+fn frame_between_two_frames_of_a_web_page_is_not_read() -> Result<()> {
+    let file = bytes(20_000, 13);
+    let (first, second) = (
+        page_seen(&page_frame(&file, Some(0)))?,
+        page_seen(&page_frame(&file, Some(1)))?,
+    );
+    let mut between = Mat::default();
+    core::add_weighted_def(&first, 0.5, &second, 0.5, 0.0, &mut between)?;
+    let mut pipeline = Pipeline::new();
+    assert_eq!(pipeline.process(&first)?, Outcome::Packet { new: true });
+    assert_eq!(pipeline.process(&between)?, Outcome::Unread);
+    let seen = &pipeline.last_survey().codes[0];
+    assert_eq!((seen.kind, seen.is_matrix()), (Kind::Unread, true));
+    assert_eq!(pipeline.packets(), Some((1, 4)));
+    assert_eq!(pipeline.process(&second)?, Outcome::Packet { new: true });
+    Ok(())
+}
+
+#[test]
+fn program_reads_the_pictures_of_a_web_page() -> Result<()> {
+    let file = bytes(50_000, 14);
+    let dir = scratch("page");
+    // the start screen and twelve frames, of which ten make the file
+    for (index, frame) in [None].into_iter().chain((0..12).map(Some)).enumerate() {
+        let path = dir.join(format!("frame_{index:03}.png"));
+        let seen = page_seen(&page_frame(&file, frame))?;
+        assert!(imgcodecs::imwrite_def(path.to_str().unwrap(), &seen)?);
+    }
+    let input = dir.join("frame_%03d.png");
+    // by two threads, with room for three frames to wait: a file waits for the room it needs
+    let run = Command::new(env!("CARGO_BIN_EXE_qqcode"))
+        .arg(&input)
+        .args(["--threads", "2", "--buffer", "3"])
+        .output()?;
+    let said = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{said}");
+    assert_eq!(run.stdout, file);
+    assert!(
+        said.contains("frame 1: start screen in view: notes.bin, 50000 bytes, waiting for the first code"),
+        "{said}"
+    );
+    let end = format!(
+        "frame 11: the file is whole\n11 frames read, 50000 bytes written to the standard output\nSHA-256 {}\nMD5 {}\n",
+        digest::sha256(&file),
+        digest::md5(&file)
+    );
+    assert!(said.ends_with(&end), "{said}");
+
+    // without the last frames the file is not whole, and the program says how far it came
+    for index in [9, 10, 11, 12] {
+        fs::remove_file(dir.join(format!("frame_{index:03}.png")))?;
+    }
+    let run = Command::new(env!("CARGO_BIN_EXE_qqcode")).arg(&input).output()?;
+    let said = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success() && run.stdout.is_empty(), "{said}");
+    assert!(
+        said.contains("the file is not whole: 8 of the 10 packets it takes have arrived"),
+        "{said}"
+    );
+    fs::remove_dir_all(&dir)?;
     Ok(())
 }
 

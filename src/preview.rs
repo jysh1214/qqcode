@@ -245,10 +245,23 @@ fn describe(code: &Sighting) -> String {
         Kind::Other => "not one of qqcode-show",
         Kind::Unread => "can't be read",
     };
-    format!(
-        "{kind} | {} modules | {:.1} px a module",
-        code.modules, code.module_size
-    )
+    match code.wrong {
+        // a matrix of tiles
+        Some(wrong) if code.kind != Kind::Unread => format!(
+            "{kind} | {} tiles across | {:.1} px a tile | {:.1} % put right",
+            code.modules,
+            code.module_size,
+            100.0 * wrong
+        ),
+        Some(_) => format!(
+            "{kind} | {} tiles across | {:.1} px a tile",
+            code.modules, code.module_size
+        ),
+        None => format!(
+            "{kind} | {} modules | {:.1} px a module",
+            code.modules, code.module_size
+        ),
+    }
 }
 
 /// What to do about what is in view.
@@ -259,7 +272,7 @@ fn advice(survey: &Survey) -> &'static str {
         Some(Kind::End) => "end screen in view",
         Some(Kind::Other) => "a QR code in view that is not one of qqcode-show",
         Some(Kind::Unread) => {
-            "a QR code in view that can't be read: nearer, sharper, or larger modules (+ in qqcode-show)"
+            "a code in view that can't be read: nearer, sharper, or larger (+ in qqcode-show, a smaller --scale)"
         }
         None => "no QR code in view",
     }
@@ -279,6 +292,7 @@ mod tests {
             kind,
             modules: 89,
             module_size: side / 89.0,
+            wrong: None,
         }
     }
 
@@ -382,7 +396,18 @@ mod tests {
             codes: vec![code(Kind::Unread, 0.0, 0.0, 300.0)],
         };
         assert_ne!(status(&start, "", "")[0][0].0, status(&unread, "", "")[0][0].0);
-        assert!(advice(&unread).contains("larger modules"));
+        assert!(advice(&unread).contains("or larger"));
+        // a matrix of tiles says how much of it had to be put right
+        let matrix = Sighting {
+            wrong: Some(0.0123),
+            modules: 176,
+            module_size: 9.04,
+            ..code(Kind::Piece, 0.0, 0.0, 1591.0)
+        };
+        assert_eq!(
+            describe(&matrix),
+            "piece of the file | 176 tiles across | 9.0 px a tile | 1.2 % put right"
+        );
     }
 
     #[test]
@@ -405,6 +430,6 @@ mod tests {
         let unread = Survey {
             codes: survey.codes[..1].to_vec(),
         };
-        assert!(advice(&unread).starts_with("a QR code in view that can't be read"));
+        assert!(advice(&unread).starts_with("a code in view that can't be read"));
     }
 }

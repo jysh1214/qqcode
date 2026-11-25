@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  /* light all around the matrix: a camera sets its exposure by the whole frame */
+  body { background: #fff; color: #222; font: 14px/1.4 system-ui, sans-serif; display: flex;
+         flex-direction: column; align-items: center; justify-content: center; overflow: hidden; }
+  canvas { display: block; image-rendering: pixelated; margin: 12px; }
+  #notes { text-align: center; padding: 0 12px 8px; max-width: 70em; }
+  #notes p { margin: 2px 0; }
+  #say { font-weight: 600; }
+  #keys, #facts { color: #666; }
+</style>
+</head>
+<body>
+<canvas id="matrix"></canvas>
+<div id="notes"><p id="say"></p><p id="facts"></p><p id="keys"></p></div>
+<script id="meta" type="application/json">{{META}}</script>
+<script id="file" type="application/octet-stream">{{FILE}}</script>
+<script>
+"use strict";
+// What qqcode-show computes in Rust for its tests is computed here for the screen: src/tiles.rs,
+// src/fountain.rs, src/packet.rs and src/rs.rs say why, this says it again in JavaScript, and the two have
+// to agree to the bit.
+
+// ---- Reed-Solomon over GF(256), src/rs.rs
+const EXP = new Uint8Array(510), LOG = new Uint8Array(256);
+for (let power = 0, value = 1; power < 255; power++) {
+  EXP[power] = EXP[power + 255] = value;
+  LOG[value] = power;
+  value <<= 1;
+  if (value & 0x100) value ^= 0x11d;
+}
+const multiply = (a, b) => (a && b ? EXP[LOG[a] + LOG[b]] : 0);
+
+function generator(parity) {
+  const poly = [1];
+  for (let root = 0; root < parity; root++) {
+    poly.push(0);
+    for (let index = poly.length - 1; index >= 1; index--) poly[index] ^= multiply(poly[index - 1], EXP[root % 255]);
+  }
+  return Uint8Array.from(poly.slice(1));
+}
+
+function checkBytes(data, poly) {
+  const parity = poly.length, check = new Uint8Array(parity);
+  for (const byte of data) {
+    const factor = byte ^ check[0];
+    check.copyWithin(0, 1);
+    check[parity - 1] = 0;
+    if (factor) for (let index = 0; index < parity; index++) check[index] ^= multiply(poly[index], factor);
+  }
+  return check;
+}
+
+// ---- the planes of a frame, src/tiles.rs
+function wordLengths(bytes) {
+  const count = Math.ceil(bytes / 255), lengths = [];
+  for (let word = 0; word < count; word++) lengths.push(Math.floor(bytes / count) + (word < bytes % count ? 1 : 0));
+  return lengths;
+}
+
+function planeData(bytes, parity) {
+  return bytes - wordLengths(bytes).length * parity;
+}
+
+function encodePlane(data, bytes, poly) {
+  const parity = poly.length, words = [];
+  let at = 0;
+  for (const length of wordLengths(bytes)) {
+    const word = new Uint8Array(length), own = data.subarray(at, at + length - parity);
+    word.set(own);
+    word.set(checkBytes(own, poly), length - parity);
+    words.push(word);
+    at += length - parity;
+  }
+  const plane = new Uint8Array(bytes);
+  let next = 0;
+  for (let place = 0; words.length && place < words[0].length; place++) {
+    for (const word of words) if (place < word.length) plane[next++] = word[place];
+  }
+  return plane;
+}
+
+function mix(bytes, state) {
+  for (let index = 0; index < bytes.length; index++) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    bytes[index] ^= state & 0xff;
+  }
+  return state;
+}
+
+class Matrix {
+  constructor(shape) {
+    Object.assign(this, shape);
+    this.width = 2 * this.border + this.columns * this.pitch;
+    this.height = 2 * this.border + this.rows * this.pitch;
+    this.cells = [];
+    for (let row = 0; row < this.rows; row++) {
+      for (let column = 0; column < this.columns; column++) {
+        const corner = (column < this.anchor || column >= this.columns - this.anchor) &&
+                       (row < this.anchor || row >= this.rows - this.anchor);
+        if (!corner) this.cells.push([this.border + column * this.pitch, this.border + row * this.pitch]);
+      }
+    }
+    this.tiles = this.cells.length;
+    this.symbolBytes = Math.floor(this.tiles / 2);
+    this.colourBytes = Math.floor(this.tiles / 4);
+    this.symbolPoly = generator(this.symbolParity);
+    this.colourPoly = generator(this.colourParity);
+    this.symbolData = planeData(this.symbolBytes, this.symbolParity);
+    this.capacity = this.symbolData + planeData(this.colourBytes, this.colourParity);
+  }
+
+  // the tiles of the frame that holds `payload`: its symbol times four plus its colour for every cell
+  pack(payload) {
+    const symbols = encodePlane(payload.subarray(0, this.symbolData), this.symbolBytes, this.symbolPoly);
+    const colours = encodePlane(payload.subarray(this.symbolData), this.colourBytes, this.colourPoly);
+    mix(colours, mix(symbols, 0x9e3779b9 | 0));
+    const tiles = new Uint8Array(this.tiles);
+    for (let tile = 0; tile < this.tiles; tile++) {
+      const symbol = (tile >> 1) < symbols.length ? (symbols[tile >> 1] >> (4 - 4 * (tile % 2))) & 15 : 0;
+      const colour = (tile >> 2) < colours.length ? (colours[tile >> 2] >> (6 - 2 * (tile % 4))) & 3 : 0;
+      tiles[tile] = symbol << 2 | colour;
+    }
+    return tiles;
+  }
+}
+
+// ---- what a frame says, src/packet.rs
+const CRC = new Uint32Array(256);
+for (let byte = 0; byte < 256; byte++) {
+  let remainder = byte;
+  for (let bit = 0; bit < 8; bit++) remainder = remainder & 1 ? 0xedb88320 ^ (remainder >>> 1) : remainder >>> 1;
+  CRC[byte] = remainder >>> 0;
+}
+
+function checksum(bytes) {
+  let crc = 0xffffffff;
+  for (let index = 0; index < bytes.length; index++) crc = CRC[(crc ^ bytes[index]) & 0xff] ^ (crc >>> 8);
+  return ~crc >>> 0;
+}
+
+function frameBytes(capacity, origin, kind, block, sequence, body) {
+  const frame = new Uint8Array(capacity), view = new DataView(frame.buffer);
+  frame[0] = frame[1] = 0x71;
+  frame[2] = kind;
+  view.setUint32(3, origin.checksum);
+  view.setUint32(7, Math.floor(origin.length / 0x100000000));
+  view.setUint32(11, origin.length >>> 0);
+  view.setUint32(15, block);
+  view.setUint32(19, sequence);
+  frame.set(body, 23);
+  view.setUint32(capacity - 4, checksum(frame.subarray(0, capacity - 4)));
+  return frame;
+}
+
+function startFrame(capacity, origin, name) {
+  let bytes = new TextEncoder().encode(name), end = Math.min(bytes.length, capacity - 27 - 2, 0xffff);
+  // cut between two characters
+  while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--;
+  bytes = bytes.subarray(0, end);
+  const body = new Uint8Array(2 + bytes.length);
+  body[0] = bytes.length >> 8;
+  body[1] = bytes.length & 0xff;
+  body.set(bytes, 2);
+  return frameBytes(capacity, origin, 0x10, 0, 0, body);
+}
+
+// ---- the packets of a file, src/fountain.rs
+function stir(value) {
+  value ^= value >>> 16;
+  value = Math.imul(value, 0x85ebca6b);
+  value ^= value >>> 13;
+  value = Math.imul(value, 0xc2b2ae35);
+  return (value ^ (value >>> 16)) >>> 0;
+}
+
+// which symbols of a block of `size` the packet `sequence` is the sum of, 32 to a word
+function terms(fileChecksum, block, sequence, size) {
+  const words = new Uint32Array(Math.ceil(size / 32));
+  if (sequence < size) {
+    words[sequence >>> 5] = 1 << (sequence & 31);
+    return words;
+  }
+  const seed = stir(fileChecksum ^ Math.imul(block, 0x9e3779b1) ^ Math.imul(sequence, 0x85ebca6b));
+  let any = false;
+  for (let half = 0; half < words.length; half++) {
+    let word = stir((seed + Math.imul(half + 1, 0x9e3779b9)) | 0);
+    const spare = Math.max(0, 32 * (half + 1) - size);
+    if (spare > 0) word = (word & (0xffffffff >>> spare)) >>> 0;
+    any = any || word !== 0;
+    words[half] = word;
+  }
+  if (!any && size > 0) words[0] = 1;
+  return words;
+}
+
+class Fountain {
+  constructor(file, origin, symbol, most) {
+    this.file = file;
+    this.origin = origin;
+    this.symbol = symbol;
+    const symbols = Math.ceil(file.length / symbol), count = Math.max(1, Math.ceil(symbols / most));
+    this.symbols = symbols;
+    this.blocks = [];
+    for (let block = 0, from = 0; block < count; block++) {
+      const size = Math.floor(symbols / count) + (block < symbols % count ? 1 : 0);
+      this.blocks.push([from, size]);
+      from += size;
+    }
+  }
+
+  // the block and the place in its sequence of the packet in frame `frame`: the blocks take turns
+  turn(frame) {
+    return [frame % this.blocks.length, Math.floor(frame / this.blocks.length)];
+  }
+
+  packet(block, sequence) {
+    const [first, size] = this.blocks[block], packet = new Uint8Array(this.symbol), file = this.file;
+    const words = terms(this.origin.checksum, block, sequence, size);
+    for (let half = 0; half < words.length; half++) {
+      for (let bit = 0, word = words[half]; word; bit++, word >>>= 1) {
+        if (!(word & 1)) continue;
+        const from = (first + 32 * half + bit) * this.symbol, to = Math.min(from + this.symbol, file.length);
+        for (let at = from; at < to; at++) packet[at - from] ^= file[at];
+      }
+    }
+    return packet;
+  }
+}
+
+// ---- the show
+class Show {
+  constructor(meta, file) {
+    this.meta = meta;
+    this.matrix = new Matrix(meta.matrix);
+    this.origin = { checksum: meta.checksum, length: file.length };
+    this.fountain = new Fountain(file, this.origin, this.matrix.capacity - 27, meta.block);
+  }
+
+  // the bytes of the start screen, and of the frame `frame` of the file
+  start() {
+    return startFrame(this.matrix.capacity, this.origin, this.meta.name);
+  }
+
+  frame(frame) {
+    const [block, sequence] = this.fountain.turn(frame);
+    return frameBytes(this.matrix.capacity, this.origin, 0x11, block, sequence, this.fountain.packet(block, sequence));
+  }
+
+  tiles(frame) {
+    return this.matrix.pack(frame === null ? this.start() : this.frame(frame));
+  }
+}
+
+function fileBytes(text) {
+  text = text.trim();
+  if (Uint8Array.fromBase64) return Uint8Array.fromBase64(text);
+  const binary = atob(text), bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+// ---- the screen
+function run() {
+  const meta = JSON.parse(document.getElementById("meta").textContent);
+  const show = new Show(meta, fileBytes(document.getElementById("file").textContent));
+  const matrix = show.matrix, canvas = document.getElementById("matrix");
+  canvas.width = matrix.width;
+  canvas.height = matrix.height;
+  const context = canvas.getContext("2d"), image = context.createImageData(matrix.width, matrix.height);
+  const pixels = new Uint32Array(image.data.buffer);
+  // red, green, blue and full opacity as the bytes of a pixel lie in memory
+  const little = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+  const colour = ([red, green, blue]) =>
+    (little ? 0xff000000 | blue << 16 | green << 8 | red : red << 24 | green << 16 | blue << 8 | 0xff) >>> 0;
+  const dark = colour([0, 0, 0]), light = colour([255, 255, 255]), colours = meta.colours.map(colour);
+  const fill = (left, top, side, value) => {
+    for (let y = top; y < top + side; y++) pixels.fill(value, y * matrix.width + left, y * matrix.width + left + side);
+  };
+  // which of the sixteen sub-cells of each symbol are lit: where its two waves differ, or do not
+  const waves = [[0, 0, 0, 0], [0, 0, 1, 1], [0, 1, 1, 0]];
+  const patterns = [[0, 1], [1, 0], [1, 1], [0, 2], [2, 0], [1, 2], [2, 1], [2, 2]];
+  const lit = [];
+  for (let symbol = 0; symbol < 16; symbol++) {
+    const [down, across] = patterns[symbol & 7], cells = [];
+    for (let cell = 0; cell < 16; cell++) {
+      if (waves[down][cell >> 2] ^ waves[across][cell & 3] ^ (symbol >> 3)) cells.push([matrix.sub * (cell & 3), matrix.sub * (cell >> 2)]);
+    }
+    lit.push(cells);
+  }
+
+  function draw(tiles) {
+    pixels.fill(dark);
+    // the finder patterns: dark, light, dark squares of 7, 5 and 3 modules in a light square
+    const square = matrix.anchor * matrix.pitch, inset = (square - 7 * matrix.module) / 2, m = matrix.module;
+    const farX = matrix.border + (matrix.columns - matrix.anchor) * matrix.pitch;
+    const farY = matrix.border + (matrix.rows - matrix.anchor) * matrix.pitch;
+    for (const [left, top] of [[matrix.border, matrix.border], [farX, matrix.border], [farX, farY], [matrix.border, farY]]) {
+      fill(left, top, square, light);
+      fill(left + inset, top + inset, 7 * m, dark);
+      fill(left + inset + m, top + inset + m, 5 * m, light);
+      fill(left + inset + 2 * m, top + inset + 2 * m, 3 * m, dark);
+    }
+    for (let tile = 0; tile < tiles.length; tile++) {
+      const [left, top] = matrix.cells[tile], value = colours[tiles[tile] & 3];
+      for (const [x, y] of lit[tiles[tile] >> 2]) fill(left + x, top + y, matrix.sub, value);
+    }
+    context.putImageData(image, 0, 0);
+  }
+
+  // as large as the window has room for, in whole pixels of the screen for a pixel of the matrix where
+  // that is possible
+  const notes = document.getElementById("notes");
+  function fit() {
+    const room = [window.innerWidth - 24, window.innerHeight - 24 - (notes.hidden ? 0 : notes.offsetHeight)];
+    let scale = Math.min(room[0] / matrix.width, room[1] / matrix.height);
+    const whole = Math.floor(scale * devicePixelRatio) / devicePixelRatio;
+    if (whole >= 1 / devicePixelRatio) scale = whole;
+    canvas.style.width = `${matrix.width * scale}px`;
+    canvas.style.height = `${matrix.height * scale}px`;
+  }
+
+  const paces = [1, 2, 5, 8, 10, 12, 15, 20, 24, 30, 60];
+  const state = { frame: null, playing: false, pace: meta.pace, shown: 0, since: 0 };
+  const size = show.origin.length === 1 ? "1 byte" : `${show.origin.length} bytes`;
+  const packets = show.fountain.symbols;
+  function tell() {
+    const seconds = Math.ceil(packets / state.pace);
+    document.getElementById("say").textContent = state.frame === null
+      ? `Ready to show ${meta.name}: ${size}. Point the camera at this; qqcode says so when it has it in view. Enter starts.`
+      : `${meta.name}: frame ${state.frame + 1}${state.playing ? "" : ", paused"}`;
+    document.getElementById("facts").textContent =
+      `${matrix.columns}x${matrix.rows} tiles, ${matrix.capacity - 27} bytes a frame, ${state.pace} frames a second: ` +
+      `${packets} frames make the file, ${seconds} s if every one of them is read`;
+    document.getElementById("keys").textContent =
+      "enter/space start, pause   + - faster, slower   g start screen   f full screen   h hide these notes";
+  }
+
+  function step(now) {
+    requestAnimationFrame(step);
+    if (!state.playing || now - state.since < 1000 / state.pace - 2) return;
+    state.since = now;
+    state.frame = state.frame === null ? 0 : state.frame + 1;
+    draw(show.tiles(state.frame));
+    // the words change a few times a second, the picture as often as it is told to
+    if (now - state.shown > 250) {
+      state.shown = now;
+      tell();
+    }
+  }
+
+  window.addEventListener("keydown", (event) => {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    const at = paces.indexOf(state.pace);
+    if (event.key === "Enter" || event.key === " ") {
+      // a file without a byte has nothing but its start screen
+      state.playing = !state.playing && packets > 0;
+    } else if (event.key === "+" || event.key === "=") {
+      state.pace = paces[Math.min(at + 1, paces.length - 1)];
+    } else if (event.key === "-" || event.key === "_") {
+      state.pace = paces[Math.max(at - 1, 0)];
+    } else if (event.key === "g") {
+      state.playing = false;
+      state.frame = null;
+      draw(show.tiles(null));
+    } else if (event.key === "f") {
+      if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen();
+    } else if (event.key === "h") {
+      notes.hidden = !notes.hidden;
+      fit();
+    } else {
+      return;
+    }
+    event.preventDefault();
+    tell();
+  });
+  window.addEventListener("resize", fit);
+  draw(show.tiles(null));
+  tell();
+  fit();
+  requestAnimationFrame(step);
+  // for whoever drives the page from outside, as its tests do
+  window.qqcode = { show, state, draw, tell };
+}
+
+if (typeof document !== "undefined") run();
+</script>
+</body>
+</html>

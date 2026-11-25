@@ -4,6 +4,7 @@
 mod chart;
 mod terminal;
 mod text;
+mod web;
 
 use std::fs;
 use std::ops::{Range, RangeInclusive};
@@ -18,6 +19,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use qqcode::code::{self, Level, MAX_VERSION};
 use qqcode::digest;
 use qqcode::protocol::{self, FileId, HEADER, Message, PIECE_HEADER};
+use qqcode::tiles::{Grid, SCALES, Shape};
 
 use chart::{Geometry, Rgb, Screen, Settings};
 use terminal::{Size, Terminal};
@@ -87,6 +89,25 @@ struct Cli {
     /// Start without the notes in the panel: what is on show, the measurements and the keys
     #[arg(long)]
     no_notes: bool,
+
+    /// Write the show as a web page to this file instead of drawing QR codes on the terminal: a matrix
+    /// of coloured tiles that holds far more than a QR code, frame after frame without end, of which
+    /// `qqcode` needs any that are enough
+    #[arg(long, value_name = "FILE")]
+    html: Option<PathBuf>,
+
+    /// Web page: the shape of the matrix, best that of the camera's frames
+    #[arg(long, value_enum, default_value_t = Shape::Wide, requires = "html")]
+    shape: Shape,
+
+    /// Web page: the size of the matrix, which has 9 rows of tiles for each; the fewer, the larger a
+    /// tile is in the frames of the camera
+    #[arg(long, default_value_t = 11, value_parser = within(SCALES), value_name = "SCALE", requires = "html")]
+    scale: usize,
+
+    /// Web page: frames a second, best half of what the camera takes or less
+    #[arg(long, default_value_t = 15, value_parser = within(1..=60), value_name = "FRAMES", requires = "html")]
+    rate: usize,
 }
 
 fn within(range: RangeInclusive<usize>) -> RangedU64ValueParser<usize> {
@@ -571,7 +592,11 @@ fn run(app: &mut App, terminal: &mut Terminal) -> Result<Size> {
 }
 
 fn main() -> Result<()> {
-    let mut app = App::new(Cli::parse())?;
+    let cli = Cli::parse();
+    if let Some(page) = &cli.html {
+        return web::write(&cli.file, page, Grid::new(cli.shape, cli.scale), cli.rate as u32);
+    }
+    let mut app = App::new(cli)?;
     let mut terminal = Terminal::open()?;
     let outcome = run(&mut app, &mut terminal);
     // back to the normal screen before anything is printed

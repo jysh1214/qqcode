@@ -558,6 +558,74 @@ mod camera {
     }
 
     #[test]
+    fn web_page_is_read_from_the_start_screen_to_the_whole_file() -> Result<()> {
+        use crate::web::Show;
+        use qqcode::tiles::{self, Grid, Shape};
+
+        let file = bytes(40_000);
+        let grid = Grid::new(Shape::Wide, 8);
+        let show = Show::new("notes.bin", &file, grid);
+        // 5292 bytes a frame, 5265 of them of the file: 8 frames
+        assert_eq!((grid.capacity(), show.frames()), (5292, 8));
+        let mut pipeline = Pipeline::new();
+        // what the page puts on the screen, seen in perspective and a little out of focus
+        let mut take = |frame: Option<u64>| -> Result<Outcome> {
+            let picture = tiles::render(grid, &show.tiles(frame));
+            let size = Pixels::new(grid.width() as i32, grid.height() as i32);
+            let mut screen = Mat::new_size_with_default(size, CV_8UC3, Scalar::all(0.0))?;
+            for (to, from) in screen
+                .data_bytes_mut()?
+                .chunks_exact_mut(3)
+                .zip(picture.chunks_exact(3))
+            {
+                to.copy_from_slice(&[from[2], from[1], from[0]]);
+            }
+            // a white page around the matrix
+            let mut page = Mat::default();
+            core::copy_make_border(
+                &screen,
+                &mut page,
+                30,
+                30,
+                30,
+                30,
+                core::BORDER_CONSTANT,
+                Scalar::all(255.0),
+            )?;
+            pipeline.process(&photograph(&page, 1.0)?)
+        };
+        assert_eq!(take(None)?, Outcome::Ready);
+        // the camera misses the second and the fifth frame of the file, and the page goes on with sums
+        // of its packets: any eight frames make the file, give or take one
+        let mut outcomes = Vec::new();
+        for frame in [0, 2, 3, 5, 6, 7, 8, 9, 10, 11] {
+            outcomes.push(take(Some(frame))?);
+            if outcomes.last() == Some(&Outcome::Complete) {
+                break;
+            }
+        }
+        assert!((8..=9).contains(&outcomes.len()), "{outcomes:?}");
+        assert!(
+            outcomes[..7]
+                .iter()
+                .all(|outcome| *outcome == Outcome::Packet { new: true })
+        );
+        assert_eq!(pipeline.take_file(), Some(file));
+        let survey = pipeline.last_survey().codes[0].clone();
+        assert_eq!(
+            (survey.kind, survey.modules, survey.is_matrix()),
+            (Kind::Piece, 128, true)
+        );
+        // some 1500 pixels of the frame for 1220 of the page
+        assert!(
+            (10.0..13.5).contains(&survey.module_size),
+            "{}",
+            survey.module_size
+        );
+        Ok(())
+    }
+
+    #[test]
     fn show_is_read_from_the_start_screen_to_the_whole_file() -> Result<()> {
         let file = bytes(3000);
         let mut app = app(&file, &[]);

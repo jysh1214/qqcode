@@ -1,10 +1,14 @@
 mod preview;
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::ops::Range;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
@@ -13,6 +17,7 @@ use opencv::prelude::*;
 use opencv::videoio;
 
 use qqcode::assembly::Assembly;
+use qqcode::scan::{Found, Scanner};
 use qqcode::{Outcome, Pipeline, digest};
 
 use preview::Preview;
@@ -44,6 +49,15 @@ struct Cli {
     /// marked, for pointing the camera; q quits
     #[arg(long)]
     preview: bool,
+
+    /// How many frames are searched for codes at a time [default: one for each processor but one]
+    #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u64).range(1..=256))]
+    threads: Option<u64>,
+
+    /// How many frames may wait to be searched. A camera never waits: what it takes while this many are
+    /// waiting is dropped
+    #[arg(long, default_value_t = 256, value_name = "FRAMES", value_parser = clap::value_parser!(u64).range(1..=65536))]
+    buffer: u64,
 }
 
 fn parse_size(text: &str) -> Result<Size, String> {
@@ -64,110 +78,171 @@ fn main() -> Result<()> {
         "the file goes to the standard output, which is this terminal: send it to a file (qqcode > FILE) or \
          name one with -o"
     );
-    let mut capture = open(&cli.input, cli.camera_size)?;
+    let capture = open(&cli.input, cli.camera_size)?;
+    // a camera goes on whatever becomes of its frames, a file can wait
+    let live = cli.input.parse::<i32>().is_ok();
     let mut log = Log {
         preview: if cli.preview { Some(Preview::open()?) } else { None },
         held: Vec::new(),
     };
-    let mut pipeline = Pipeline::new();
 
+    // The frames go from the camera into a buffer, are searched for codes by as many threads as there
+    // are, and what is found in them is taken in here, in the order of the frames.
+    let buffer = Arc::new(Buffer::new(cli.buffer as usize));
+    let dropped = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let camera = {
+        let (buffer, dropped, stop) = (buffer.clone(), dropped.clone(), stop.clone());
+        thread::spawn(move || capture_frames(capture, &buffer, live, &dropped, &stop))
+    };
+    let threads = cli.threads.map_or_else(
+        || thread::available_parallelism().map_or(1, |count| count.get().saturating_sub(1).max(1)),
+        |count| count as usize,
+    );
+    let scanner = Arc::new(Scanner::default());
+    let (found_by, found) = mpsc::channel();
+    for _ in 0..threads {
+        let (buffer, scanner, found_by) = (buffer.clone(), scanner.clone(), found_by.clone());
+        thread::spawn(move || {
+            while let Some((number, frame)) = buffer.take() {
+                let codes = scanner.scan(&frame);
+                if found_by.send((number, frame, codes)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(found_by);
+
+    let mut pipeline = Pipeline::new();
     let (mut frames, mut unread) = (0u64, 0u64);
     // the screen of qqcode-show that the last frame with one of its codes showed
     let mut screen = None;
     let mut file = None;
     let (mut frame_rate, mut frame_at) = (0.0, Instant::now());
-    let mut frame = Mat::default();
-    while capture.read(&mut frame)? && !frame.empty() {
-        frames += 1;
-        let files_before = pipeline.files();
-        let outcome = pipeline
-            .process(&frame)
-            .with_context(|| format!("frame {frames}"))?;
-        if files_before > 0 && pipeline.files() > files_before {
-            log.say(format!(
-                "frame {frames}: the codes of another file, which is the one that is read from here on"
-            ));
-            screen = None;
-        }
-        let screen_before = screen;
-        match outcome {
-            Outcome::NoCode | Outcome::Other => {}
-            Outcome::Unread => unread += 1,
-            Outcome::Ready => {
-                screen = Some(Shown::Start);
-                if screen_before != screen {
-                    log.say(format!(
-                        "frame {frames}: start screen in view{}, waiting for the first code",
-                        named(&pipeline)
-                    ));
-                }
-            }
-            Outcome::Piece { new, skipped } => {
-                screen = Some(Shown::Codes);
-                if skipped > 0 {
-                    log.say(format!(
-                        "frame {frames}: {} went by unread",
-                        count(skipped, "byte")
-                    ));
-                }
-                if new > 0 {
-                    log.tell(format!("frame {frames}: {}", progress(&pipeline)));
-                }
-            }
-            Outcome::Done => {
-                screen = Some(Shown::End);
-                if screen_before != screen {
-                    let missing = pipeline
-                        .assembly()
-                        .map_or(String::new(), |assembly| format!(", {}", lacking(assembly)));
-                    log.say(format!(
-                        "frame {frames}: end screen in view{missing}; g in qqcode-show shows the codes again"
-                    ));
-                }
-            }
-            Outcome::Corrupt => {
-                screen = None;
+    let (mut told_at, mut drawn_at) = (Instant::now(), None::<Instant>);
+    // what was found in frames that came back before an earlier one
+    let mut early: BTreeMap<u64, (Mat, Vec<Found>)> = BTreeMap::new();
+    'frames: for (number, frame, codes) in found {
+        early.insert(number, (frame, codes.with_context(|| format!("frame {number}"))?));
+        while let Some((frame, codes)) = early.remove(&(frames + 1)) {
+            frames += 1;
+            let files_before = pipeline.files();
+            let outcome = pipeline.take(codes);
+            if files_before > 0 && pipeline.files() > files_before {
                 log.say(format!(
-                    "frame {frames}: all pieces have arrived and the checksum of the file is wrong, so a code \
-                     was misread: starting over, g in qqcode-show shows the codes again"
+                    "frame {frames}: the codes of another file, which is the one that is read from here on"
                 ));
+                screen = None;
             }
-            Outcome::Complete => {
-                file = pipeline.take_file();
-                log.say(format!("frame {frames}: the file is whole"));
+            let screen_before = screen;
+            match outcome {
+                Outcome::NoCode | Outcome::Other => {}
+                Outcome::Unread => unread += 1,
+                Outcome::Ready => {
+                    screen = Some(Shown::Start);
+                    if screen_before != screen {
+                        log.say(format!(
+                            "frame {frames}: start screen in view{}, waiting for the first code",
+                            named(&pipeline)
+                        ));
+                    }
+                }
+                Outcome::Piece { new, skipped } => {
+                    screen = Some(Shown::Codes);
+                    if skipped > 0 {
+                        log.say(format!(
+                            "frame {frames}: {} went by unread",
+                            count(skipped, "byte")
+                        ));
+                    }
+                    if new > 0 {
+                        log.tell(format!("frame {frames}: {}", progress(&pipeline)));
+                    }
+                }
+                Outcome::Packet { new } => {
+                    screen = Some(Shown::Codes);
+                    // a line a second, not one for each of the frames
+                    if new && told_at.elapsed() >= Duration::from_secs(1) {
+                        told_at = Instant::now();
+                        log.tell(format!("frame {frames}: {}", progress(&pipeline)));
+                    }
+                }
+                Outcome::Done => {
+                    screen = Some(Shown::End);
+                    if screen_before != screen {
+                        let missing = pipeline
+                            .assembly()
+                            .map_or(String::new(), |assembly| format!(", {}", lacking(assembly)));
+                        log.say(format!(
+                            "frame {frames}: end screen in view{missing}; g in qqcode-show shows the codes again"
+                        ));
+                    }
+                }
+                Outcome::Corrupt => {
+                    screen = None;
+                    log.say(format!(
+                        "frame {frames}: all of the file has arrived and its checksum is wrong, so something \
+                         was misread: starting over with what is still on show"
+                    ));
+                }
+                Outcome::Complete => {
+                    file = pipeline.take_file();
+                    log.say(format!("frame {frames}: the file is whole"));
+                }
             }
-        }
-        if let Some(preview) = &mut log.preview {
             // smoothed over the last few frames
             let now = Instant::now();
             let rate = 1.0 / now.duration_since(frame_at).as_secs_f64().max(1e-3);
             frame_rate = if frames == 1 {
                 rate
             } else {
-                0.8 * frame_rate + 0.2 * rate
+                0.9 * frame_rate + 0.1 * rate
             };
             frame_at = now;
-            let size = frame.size()?;
-            let facts = format!(
-                "{}x{} | frame {frames} | {frame_rate:.1} frames a second | {}",
-                size.width,
-                size.height,
-                progress(&pipeline)
-            );
-            let remark = log.held.last().map_or("", String::as_str);
-            preview.draw(&frame, pipeline.last_survey(), &facts, remark)?;
-            if preview.quit_requested()? {
-                log.say(format!("frame {frames}: stopped by a key"));
-                break;
+            // the terminal takes its time over a picture: a dozen of them a second are enough to point by
+            let due = drawn_at.is_none_or(|at| at.elapsed() >= Duration::from_millis(80)) || file.is_some();
+            if let Some(preview) = &mut log.preview
+                && due
+            {
+                drawn_at = Some(Instant::now());
+                let size = frame.size()?;
+                let facts = format!(
+                    "{}x{} | frame {frames} | {frame_rate:.1} frames a second | {} waiting | {}",
+                    size.width,
+                    size.height,
+                    buffer.waiting(),
+                    progress(&pipeline)
+                );
+                let remark = log.held.last().map_or("", String::as_str);
+                preview.draw(&frame, pipeline.last_survey(), &facts, remark)?;
+                if preview.quit_requested()? {
+                    log.say(format!("frame {frames}: stopped by a key"));
+                    break 'frames;
+                }
+            }
+            if file.is_some() {
+                break 'frames;
             }
         }
-        if file.is_some() {
-            break;
-        }
     }
+    // nothing more is wanted of the camera or of the frames that wait
+    stop.store(true, Ordering::Relaxed);
+    buffer.close();
+    let taken = camera
+        .join()
+        .map_err(|_| anyhow::anyhow!("the camera's thread failed"))??;
     // the terminal comes back before anything else is said
     log.close();
 
+    let dropped = dropped.load(Ordering::Relaxed);
+    if dropped > 0 {
+        eprintln!(
+            "{dropped} frames of the camera were dropped, as {} were waiting to be searched: more --threads or \
+             a larger --buffer keep them",
+            cli.buffer
+        );
+    }
     if let Some(file) = file {
         let to = match &cli.output {
             Some(path) => {
@@ -191,18 +266,126 @@ fn main() -> Result<()> {
         eprintln!("MD5 {}", digest::md5(&file));
         return Ok(());
     }
-    if frames == 0 {
+    if taken == 0 {
         bail!("no frame could be read from {}", cli.input);
     }
     eprintln!("{frames} frames read, nothing written");
-    match pipeline.assembly() {
-        Some(assembly) => bail!("the file is not whole: {}", lacking(assembly)),
-        None if unread > 0 => bail!(
-            "no code of qqcode-show was read; {unread} frames showed a QR code that could not be: nearer, \
-             sharper, or larger modules"
-        ),
-        None => bail!("no frame showed a code of qqcode-show"),
+    if let Some(assembly) = pipeline.assembly() {
+        bail!("the file is not whole: {}", lacking(assembly));
     }
+    if let Some((held, needed)) = pipeline.packets() {
+        bail!("the file is not whole: {held} of the {needed} packets it takes have arrived");
+    }
+    if unread > 0 {
+        bail!(
+            "no code of qqcode-show was read; {unread} frames showed one that could not be: nearer, sharper, \
+             or larger modules"
+        );
+    }
+    bail!("no frame showed a code of qqcode-show")
+}
+
+/// The frames that wait to be searched for codes, in the order they were taken.
+struct Buffer {
+    room: usize,
+    state: Mutex<Waiting>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct Waiting {
+    frames: VecDeque<(u64, Mat)>,
+    /// How many frames have been put in, which numbers them from 1
+    taken: u64,
+    closed: bool,
+}
+
+impl Buffer {
+    fn new(room: usize) -> Self {
+        Self {
+            room,
+            state: Mutex::default(),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, Waiting> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Puts a frame in. If there is no room for it, the frame is dropped, unless it is to `wait` for room.
+    /// Whether it was put in.
+    fn put(&self, frame: Mat, wait: bool) -> bool {
+        let mut state = self.state();
+        while wait && state.frames.len() >= self.room && !state.closed {
+            state = self.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+        if state.closed || state.frames.len() >= self.room {
+            return false;
+        }
+        state.taken += 1;
+        let number = state.taken;
+        state.frames.push_back((number, frame));
+        self.changed.notify_all();
+        true
+    }
+
+    /// The frame that has waited longest, with its number; `None` once the buffer is closed and empty.
+    fn take(&self) -> Option<(u64, Mat)> {
+        let mut state = self.state();
+        loop {
+            if let Some(frame) = state.frames.pop_front() {
+                self.changed.notify_all();
+                return Some(frame);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn waiting(&self) -> usize {
+        self.state().frames.len()
+    }
+
+    /// No more frames come: those that wait are still given out.
+    fn end(&self) {
+        self.state().closed = true;
+        self.changed.notify_all();
+    }
+
+    /// No more frames are wanted: those that wait are dropped.
+    fn close(&self) {
+        let mut state = self.state();
+        state.closed = true;
+        state.frames.clear();
+        self.changed.notify_all();
+    }
+}
+
+/// Puts the frames of a camera or file into the buffer until they end or `stop` says so. Returns how many
+/// frames there were.
+fn capture_frames(
+    mut capture: videoio::VideoCapture,
+    buffer: &Buffer,
+    live: bool,
+    dropped: &AtomicU64,
+    stop: &AtomicBool,
+) -> Result<u64> {
+    let mut taken = 0;
+    while !stop.load(Ordering::Relaxed) {
+        let mut frame = Mat::default();
+        if !capture.read(&mut frame)? || frame.empty() {
+            break;
+        }
+        taken += 1;
+        if !buffer.put(frame, !live) && !stop.load(Ordering::Relaxed) {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    buffer.end();
+    Ok(taken)
 }
 
 /// The screens of `qqcode-show`.
@@ -237,7 +420,11 @@ fn named(pipeline: &Pipeline) -> String {
 fn progress(pipeline: &Pipeline) -> String {
     match (pipeline.received(), pipeline.file()) {
         (Some(received), Some(file)) => {
-            format!("{received} of {}", count(file.length as usize, "byte"))
+            let bytes = format!("{received} of {}", count(file.length as usize, "byte"));
+            match pipeline.packets() {
+                Some((held, needed)) => format!("{bytes}, {held} of {needed} packets"),
+                None => bytes,
+            }
         }
         _ => "no code of qqcode-show read".to_owned(),
     }

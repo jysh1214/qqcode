@@ -1,22 +1,35 @@
 # qqcode
 
-Carries a file from one machine to another through a screen and a camera. `qqcode-show` shows the file on
-a terminal as a sequence of QR codes, `qqcode` reads the codes from the frames of a camera and writes the
-file. Written in Rust; the frames come through OpenCV.
+Carries a file from one machine to another through a screen and a camera. `qqcode-show` puts the file on
+the screen, `qqcode` reads it from the frames of a camera and writes it. Written in Rust; the frames come
+through OpenCV.
 
 ```sh
-qqcode-show notes.tar.gz     # where the file is, in a terminal that the camera sees
-qqcode > notes.tar.gz        # where the camera is
+qqcode-show notes.tar.gz --html show.html     # where the file is: a page for a browser the camera sees
+qqcode > notes.tar.gz                         # where the camera is
 ```
 
-`qqcode-show` cuts the file into pieces and puts each into a code, together with the checksum and the length
-of the file and the place of the piece in it. `qqcode`, per frame:
+There are two ways to show a file, and `qqcode` reads either:
 
-1. finds the QR codes and decodes them (the QR reader of `rxing`);
-2. takes the one that is a code of `qqcode-show` and puts its piece where it belongs in the file;
-3. once every byte has arrived, checks the checksum, writes the file and ends.
+| | on show | a frame holds | a second holds |
+| --- | --- | --- | --- |
+| [web page](#the-web-page), `--html` | a matrix of coloured tiles, frame after frame without end | 10 kB by default, up to some 21 kB for a camera of 1920x1080 | 151 kB at 15 frames |
+| [terminal](#qqcode-show-on-a-terminal) | QR codes drawn with half block characters, one after the other | 0.8 kB on a terminal of 200x60 cells, 2.9 kB at most | 1.7 kB at 2 codes |
 
-Nothing in that is a neural network, so neither program has a use for a GPU.
+The terminal needs nothing but a terminal. The page is what to use where a browser is to be had: it is some
+ninety times faster, and a frame that the camera misses costs it nothing, as any frames that are enough
+make the file.
+
+`qqcode`, per frame:
+
+1. finds the finder patterns in it (those of a QR code, which the matrix has in its corners as well);
+2. reads the matrix between four of them, tile by tile, or decodes the QR code (the QR reader of `rxing`);
+3. takes what the frame says into the file: a packet of the page, or the piece that a QR code holds;
+4. once the file is whole, checks its checksum, writes it and ends.
+
+The frames go from the camera into a buffer and are read by as many threads as the machine has processors,
+so the camera never waits for the reading. Nothing in that is a neural network, so neither program has a
+use for a GPU.
 
 ## Building
 
@@ -57,6 +70,7 @@ Environment variables read by the OpenCV build:
 ```sh
 qqcode > notes.tar.gz                                  # camera 0
 qqcode 2 -o notes.tar.gz --preview                     # camera 2, with a view of what it sees
+qqcode --threads 4 --buffer 64 > notes.tar.gz          # on a machine with little memory
 qqcode --camera-size 1280x720 > notes.tar.gz           # smaller frames
 qqcode recording.mp4 > notes.tar.gz                    # a video of the show instead of a camera
 qqcode 'frame_%04d.png' > notes.tar.gz                 # or pictures of it
@@ -68,6 +82,8 @@ qqcode 'frame_%04d.png' > notes.tar.gz                 # or pictures of it
 | `-o`, `--output` | the standard output | file to write |
 | `--camera-size` | `1920x1080` | frame size to ask a camera for, `WIDTHxHEIGHT`; see below |
 | `--preview` | off | show what the camera sees on the terminal, with the codes that are found; see below |
+| `--threads` | one for each processor but one | how many frames are read at a time |
+| `--buffer` | `256` | how many frames may wait to be read; see below |
 
 The file is written when it is whole and its checksum is right, in one piece, and nothing of it before that:
 a run that is stopped, or whose video ends too early, leaves an empty file behind `>` and none at all behind
@@ -91,7 +107,23 @@ the file it shows on its end screen and prints them when it quits, and `sha256su
 same of either file: they are there to be compared, by whoever wants more than the checksum in the codes,
 which `qqcode` has checked by then.
 
+### Frames that wait
+
+A camera goes on taking frames whatever becomes of them, so reading must not hold it up. One thread does
+nothing but take the frames and put them into a buffer; the others take them out and read them, and what
+they find is put together in the order of the frames. A frame of the web page takes some 30 ms to read and
+one that can't be read up to twice that, so two or three threads keep up with a camera, and the rest of
+them are there for the moments in which every frame is a hard one.
+
+If the threads do not keep up, the frames wait, as many as `--buffer` says, and are read later: nothing
+is lost by reading slowly but time. Only when that many are waiting are the frames of a camera dropped, and
+`qqcode` says at the end how many were. A frame of 1920x1080 takes 6 MB while it waits, so the 256 of the
+default come to 1.6 GB at worst. A video file or pictures are never dropped: reading them waits for room.
+
 ### Codes that are missed
+
+What follows is about the QR codes of a terminal. A page has no codes to miss: it goes on showing packets,
+and `qqcode` ends when it has enough of them.
 
 A code that no frame shows sharply enough is a hole in the file. `qqcode` says so when the next code comes
 (`frame 64: 842 bytes went by unread`), and when the end screen comes it names what is missing:
@@ -127,7 +159,106 @@ Reading goes on as without the preview; what `qqcode` would otherwise write to t
 is printed when it ends. `q` ends it. The preview is drawn through the standard error, which leaves the
 standard output to the file.
 
-## `qqcode-show`
+## The web page
+
+```sh
+qqcode-show notes.tar.gz --html show.html                       # 176x99 tiles, 15 frames a second
+qqcode-show notes.tar.gz --html show.html --scale 16 --rate 12  # more tiles, for a sharp camera
+qqcode-show notes.tar.gz --html show.html --shape classic       # for a camera with frames of 4:3
+```
+
+```
+wrote show.html: notes.tar.gz, 3000000 bytes in 298 frames of 10077 bytes, 15 a second: 151 kB a second, 20 s if every frame is read
+matrix of 176x99 tiles, 1592x899 px: best shown at that size or a whole multiple of it, and filling the frames of the camera
+```
+
+The page is one file that loads nothing else and has the file to show inside it, so it is about a third
+larger than that. It can be copied to whatever has the screen. A browser shows the matrix as large as its
+window allows, on a white ground, and begins on a start screen that says what the file is called and how
+long it is. `qqcode` says when it has that in view, which is the moment to press `enter`: the frames
+follow, `--rate` of them a second, without end. `qqcode` ends by itself when it has the file.
+
+| Key | |
+| --- | --- |
+| `enter`, `space` | start, pause, go on |
+| `+` `-` | more, fewer frames a second |
+| `g` | back to the start screen |
+| `f` | the whole screen |
+| `h` | hide the notes below the matrix |
+
+| Option | Default | |
+| --- | --- | --- |
+| `--html` | | file to write the page to |
+| `--shape` | `wide` | shape of the matrix: `wide` is 16:9, `classic` 4:3, `square` 1:1; best that of the camera's frames |
+| `--scale` | `11` | size of the matrix, 4 to 24: it has 9 rows of tiles for each |
+| `--rate` | `15` | frames a second, 1 to 60 |
+
+### The matrix
+
+A tile is a square of 8 pixels on a dark ground, 9 pixels from the next one: one of sixteen symbols in one
+of four colours, which makes six bits. A symbol is made of sub-cells of 2 pixels, lit or dark, and half of
+it is always lit, so that every tile shows its colour. The sixteen are as unlike each other as patterns of
+four by four sub-cells can be, and none has a feature finer than a sub-cell. In the four corners of the
+matrix sit the finder patterns of a QR code, by which `qqcode` finds the matrix and lays it flat.
+
+The bytes of a frame are spread over the tiles in two planes, the symbols and the colours, each with
+Reed-Solomon check bytes of its own: 64 in every 255 bytes of symbols, which puts right a frame in which
+one symbol in sixteen is misread, and 40 in every 255 bytes of colours, which does the same for one colour
+in fifty. The symbols have more of them: in the measurements below it is the symbols that a blurred or
+compressed frame gets wrong, far more often than a colour. `qqcode --preview` says how much of a frame it had to put right.
+
+| `--scale`, shape `wide` | Tiles | Pixels | Bytes of the file in a frame | At 15 frames a second |
+| --- | --- | --- | --- | --- |
+| 8 | 128x72 | 1160x656 | 5265 | 79 kB a second |
+| 11 | 176x99 | 1592x899 | 10077 | 151 kB a second |
+| 14 | 224x126 | 2024x1142 | 16329 | 245 kB a second |
+| 16 | 256x144 | 2312x1304 | 21465 | 322 kB a second |
+
+### Any frames that are enough
+
+A screen can show a camera more frames than the camera catches, and nothing tells the screen which ones
+were lost. So the page does not show the file piece by piece and then over again. It cuts the file into
+packets of what a frame holds, shows each once, and after that shows sums of them without end: each the
+exclusive or of about half the packets of a block of up to 512, picked by numbers that follow from the
+frame's place in the sequence. Whoever has as many frames of a block as the block has packets, whichever
+they are, can solve for the packets, give or take a frame or two. A camera that misses a third of the
+frames takes half as long again, and never has to wait for a particular one to come round.
+
+The file has no upper limit in this but memory: the browser holds the page, and `qqcode` what it has
+collected. 1 GB is 99,000 frames at the default size, an hour and fifty minutes at 15 a second.
+
+### What the camera has to manage
+
+Two things: enough pixels for a tile, and frames that are sharp. Measured on synthetic frames of 1920x1080
+with the matrix of 176x99 tiles; no camera took part:
+
+| Blur of the frame | The frames are read down to |
+| --- | --- |
+| none, 0.7 px, 1 px | 0.7 px of the frame to a pixel of the page: 6.3 px a tile |
+| 1.25 px | 0.85 px to a pixel: 7.7 px a tile |
+| 1.5 px | 1 px to a pixel: 9 px a tile |
+
+That holds for frames that a camera packs as JPEG of quality 70 with colour at half the sharpness, as
+cameras do that send Motion JPEG; at these limits up to one symbol in twenty is misread then, which the
+check bytes make up for, and hardly a colour. At quality 50 the frames at the limits are lost.
+
+So a camera of 1920x1080 whose frames the page fills from top to bottom has room for a matrix of some
+1080 pixels in height at 1 px to a pixel, which is `--scale 13`, and for `--scale 18` if it is sharp enough
+for 0.7. The default leaves a wide margin: it is still read where it takes 1114x629 pixels of such a frame,
+or fills one of 1280x720. `qqcode --preview` shows the pixels a tile gets and the share of the frame that
+had to be put right; a frame is lost when that share goes beyond a few percent, and the first things to
+try then are a smaller `--scale` and a camera nearer to the screen.
+
+The page should show a frame for at least two frames of the camera, so that one of them has it whole:
+15 a second for a camera that takes 30. A frame of the camera that is taken while the page changes shows
+two frames at once and is read as none, which costs nothing but that frame. What these measurements do
+not have is what a real camera adds: moiré between its pixels and those of the screen, glare, colours
+that are far from those of the page, and a lens that bends the picture. The reading follows a bend of some
+pixels, as it finds the tiles area by area rather than where the corners put them, and it takes the
+colours as the frame has them rather than as they ought to be, but how far that goes with a given camera
+only that camera can tell.
+
+## `qqcode-show` on a terminal
 
 ```sh
 qqcode-show notes.tar.gz                              # a new code every half second
@@ -204,7 +335,7 @@ taken while the screen changes show two codes at once and are read as none.
 
 ### What a code says
 
-Every code holds one message, in the byte mode of QR codes:
+Every QR code holds one message, in the byte mode of QR codes:
 
 ```
 start   "qq" 1 checksum length name...
@@ -218,9 +349,24 @@ QR code that does not begin like this is none of `qqcode-show` and is passed ove
 file than the one being read make `qqcode` start over with that file. The SHA-256 and the MD5 that both
 programs print are not in the codes.
 
+A frame of the web page is always full, and says:
+
+```
+start    "qq" 0x10 checksum length 0     0        length of the name, name, zeros     check
+packet   "qq" 0x11 checksum length block sequence bytes of the packet                 check
+```
+
+The length is a number of 64 bits here; block and sequence say which packet of which block this is, from
+which follows what it is the sum of; and the check is the CRC-32 of the frame, which keeps a frame that
+was put right wrongly out of the sums, where it would spoil a whole block.
+
 ## Tests
 
-`cargo test` needs neither a camera nor a terminal: unit tests for the pure logic, the tests of
-`qqcode-show`, which have its screens drawn as images, photographed at an angle and out of focus and read
-back as the file, and `tests/pipeline.rs`, which does the same with single codes and runs the program
-`qqcode` on pictures.
+`cargo test` needs neither a camera nor a terminal nor a browser: unit tests for the pure logic, the tests
+of `qqcode-show`, which have its screens and the frames of its page drawn as images, photographed at an
+angle and out of focus and read back as the file, and `tests/pipeline.rs`, which does the same with single
+codes and frames and runs the program `qqcode` on pictures.
+
+The page computes in JavaScript what the library computes in Rust, and one test has both make the tiles
+of the same frames and compares them. It runs the script of the page in `deno`; without `deno` on `PATH`
+it says so and passes.
