@@ -15,7 +15,8 @@ pub fn fit(text: &str, width: usize) -> &str {
 }
 
 /// `text` as rows of at most `width` columns. Its lines are broken at spaces; a word that is wider than a
-/// row on its own is broken wherever the row ends. An empty line is one empty row.
+/// row on its own, such as a checksum, goes on in the row that is begun and is broken wherever a row ends.
+/// An empty line is one empty row.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut rows = Vec::new();
     if width == 0 {
@@ -34,6 +35,15 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
                     row.push(' ');
                 }
             } else {
+                if word.width() > width {
+                    // no row holds it anyway: as much of it as the one that is begun has room for
+                    let head = fit(word, width.saturating_sub(row.width() + gap));
+                    if !head.is_empty() {
+                        row.push_str(&" "[..gap]);
+                        row.push_str(head);
+                        word = &word[head.len()..];
+                    }
+                }
                 if !row.is_empty() {
                     rows.push(std::mem::take(&mut row));
                 }
@@ -80,7 +90,11 @@ mod tests {
 
     #[test]
     fn a_word_wider_than_the_row_is_broken_inside() {
-        assert_eq!(wrap("a 0123456789abc b", 5), ["a", "01234", "56789", "abc b"]);
+        assert_eq!(wrap("a 0123456789abc b", 5), ["a 012", "34567", "89abc", "b"]);
+        assert_eq!(
+            wrap("MD5 900150983cd24fb0d6963f7d28e17f72", 20),
+            ["MD5 900150983cd24fb0", "d6963f7d28e17f72"]
+        );
         // two columns per character
         assert_eq!(wrap("漢字漢字漢", 4), ["漢字", "漢字", "漢"]);
         assert_eq!(wrap("漢字", 1), ["漢", "字"]);

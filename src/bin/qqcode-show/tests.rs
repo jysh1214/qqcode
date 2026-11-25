@@ -119,6 +119,7 @@ fn every_screen_has_the_code_that_says_what_it_is() {
     let mut app = app(&file, &[]);
     app.lay_out(80, 24);
     let id = FileId::of(&file).unwrap();
+    let sha256 = digest::sha256(&file);
     // the code as the screen has it: version 5 from the sixth dot on, a dot a module
     let shown = |app: &App| {
         let screen = app.screen(&SIZE);
@@ -172,6 +173,30 @@ fn every_screen_has_the_code_that_says_what_it_is() {
         end.contains("End of") && end.contains("end, 3 codes shown"),
         "{end}"
     );
+    // the SHA-256 and the MD5 of the file, in as many rows as they take
+    let unbroken = end.replace(' ', "");
+    assert!(end.contains("SHA-256") && unbroken.contains(&sha256), "{end}");
+    assert!(
+        end.contains("MD5") && unbroken.contains(&digest::md5(&bytes(200))),
+        "{end}"
+    );
+}
+
+#[test]
+fn file_is_named_by_its_digests_at_the_end() {
+    let app = app(b"abc", &[]);
+    assert_eq!(
+        app.sha256,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(app.md5, "900150983cd24fb0d6963f7d28e17f72");
+    let end = app.end_message();
+    let sha256 = end
+        .iter()
+        .position(|line| *line == format!("SHA-256 {}", app.sha256));
+    let md5 = end.iter().position(|line| *line == format!("MD5 {}", app.md5));
+    // one below the other
+    assert_eq!(sha256.zip(md5).map(|(sha256, md5)| md5 - sha256), Some(1));
 }
 
 #[test]

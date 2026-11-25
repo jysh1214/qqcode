@@ -82,7 +82,14 @@ frame 64: 1684 of 3000 bytes
 frame 70: 2526 of 3000 bytes
 frame 76: the file is whole
 76 frames read, 3000 bytes written to the standard output
+SHA-256 03172bf1dc18c2c972ff3b2cca2fcf4e800c6dd590474210b53c193aaeaf8bc9
+MD5 7850bf91f76b3d7e90d3b7b4eacec425
 ```
+
+The last two lines are the SHA-256 and the MD5 of the file as it was written. `qqcode-show` has those of
+the file it shows on its end screen and prints them when it quits, and `sha256sum` and `md5sum` say the
+same of either file: they are there to be compared, by whoever wants more than the checksum in the codes,
+which `qqcode` has checked by then.
 
 ### Codes that are missed
 
@@ -163,11 +170,14 @@ The rest is set with options, and with keys while the codes are on show:
 
 `enter`, `space` and `n` go to the next code, `p` to the one before, `g` and `G` to the first and the last.
 `q` quits and prints the options for the layout as it was then, along with what the terminal measured, so
-that a setup that read well can be noted down and shown again:
+that a setup that read well can be noted down and shown again, and the SHA-256 and the MD5 of the file, to
+be compared with those that `qqcode` prints:
 
 ```
 qqcode-show notes.tar.gz --module 1 --margin 4 --level m --interval 0.2
 terminal 200x60 cells, cell 9x18 px, version 23, code 109x54.5 cells = 981x981 px, 842 bytes a code, 4 codes
+SHA-256 03172bf1dc18c2c972ff3b2cca2fcf4e800c6dd590474210b53c193aaeaf8bc9
+MD5 7850bf91f76b3d7e90d3b7b4eacec425
 ```
 
 ### How large the modules have to be
@@ -205,7 +215,8 @@ end     "qq" 3 checksum length
 The checksum is the CRC-32 of the whole file and names the file together with its length; both are
 numbers of 32 bits, most significant byte first, as is the offset, so a file can have 4 GiB less a byte. A
 QR code that does not begin like this is none of `qqcode-show` and is passed over, and codes of another
-file than the one being read make `qqcode` start over with that file.
+file than the one being read make `qqcode` start over with that file. The SHA-256 and the MD5 that both
+programs print are not in the codes.
 
 ## Tests
 

@@ -13,7 +13,7 @@ use opencv::prelude::*;
 use opencv::videoio;
 
 use qqcode::assembly::Assembly;
-use qqcode::{Outcome, Pipeline};
+use qqcode::{Outcome, Pipeline, digest};
 
 use preview::Preview;
 
@@ -186,6 +186,9 @@ fn main() -> Result<()> {
             "{frames} frames read, {} written to {to}",
             count(file.len(), "byte")
         );
+        // to be compared with what qqcode-show prints, or sha256sum and md5sum where the file comes from
+        eprintln!("SHA-256 {}", digest::sha256(&file));
+        eprintln!("MD5 {}", digest::md5(&file));
         return Ok(());
     }
     if frames == 0 {

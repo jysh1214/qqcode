@@ -16,6 +16,7 @@ use clap::builder::RangedU64ValueParser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use qqcode::code::{self, Level, MAX_VERSION};
+use qqcode::digest;
 use qqcode::protocol::{self, FileId, HEADER, Message, PIECE_HEADER};
 
 use chart::{Geometry, Rgb, Screen, Settings};
@@ -125,6 +126,9 @@ struct App {
     file: PathBuf,
     bytes: Vec<u8>,
     id: FileId,
+    /// The SHA-256 and the MD5 of the file, see [`digest`]
+    sha256: String,
+    md5: String,
     /// Seconds that a code stays; `None` if the keys alone turn the codes
     interval: Option<f64>,
     settings: Settings,
@@ -161,6 +165,8 @@ impl App {
         );
         Ok(Self {
             file: cli.file,
+            sha256: digest::sha256(&bytes),
+            md5: digest::md5(&bytes),
             bytes,
             id,
             interval: Some(cli.interval).filter(|seconds| *seconds > 0.0),
@@ -380,8 +386,11 @@ impl App {
         vec![
             format!("End of {}.", self.file.display()),
             String::new(),
-            "qqcode has ended by itself if it has read every code. If it names parts that are missing, g \
-             shows the codes again."
+            format!("SHA-256 {}", self.sha256),
+            format!("MD5 {}", self.md5),
+            String::new(),
+            "qqcode has ended by itself if it has read every code, and has printed the same SHA-256 and \
+             MD5. If it names parts that are missing, g shows the codes again."
                 .to_owned(),
             String::new(),
             "p goes back, g starts again, q quits.".to_owned(),
@@ -570,6 +579,9 @@ fn main() -> Result<()> {
     let size = outcome?;
     println!("{}", app.command_line());
     println!("{}", app.measurements(&size));
+    // to be compared with what qqcode prints when it has written the file
+    println!("SHA-256 {}", app.sha256);
+    println!("MD5 {}", app.md5);
     Ok(())
 }
 

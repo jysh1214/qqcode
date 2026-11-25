@@ -37,5 +37,8 @@ rxing = { version = "0.9", default-features = false, features = [
     "encoding_rs",
     "qrcode",
 ] }
+# the MD5 and the SHA-256 that both programs print of the file when they end
+md-5 = { version = "0.11", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 # how many terminal columns a piece of text takes
 unicode-width = "0.2"

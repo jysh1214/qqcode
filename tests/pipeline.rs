@@ -14,7 +14,7 @@ use opencv::{imgcodecs, imgproc};
 
 use qqcode::code::{self, Level};
 use qqcode::protocol::{FileId, Message};
-use qqcode::{Kind, Outcome, Pipeline};
+use qqcode::{Kind, Outcome, Pipeline, digest};
 
 const VERSION: usize = 12;
 const LEVEL: Level = Level::M;
@@ -352,13 +352,14 @@ fn program_writes_the_file_to_the_standard_output() -> Result<()> {
         "{said}"
     );
     assert!(said.contains("frame 3: 544 of 700 bytes"), "{said}");
-    // it ends with the piece that completes the file, before the end screen
-    assert!(
-        said.ends_with(
-            "frame 4: the file is whole\n4 frames read, 700 bytes written to the standard output\n"
-        ),
-        "{said}"
+    // it ends with the piece that completes the file, before the end screen, and with the SHA-256 and
+    // the MD5 of what it wrote
+    let end = format!(
+        "frame 4: the file is whole\n4 frames read, 700 bytes written to the standard output\nSHA-256 {}\nMD5 {}\n",
+        digest::sha256(&file),
+        digest::md5(&file)
     );
+    assert!(said.ends_with(&end), "{said}");
 
     // and to a file that is named, with nothing on the standard output
     let output = dir.join("read.bin");
