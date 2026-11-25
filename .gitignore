@@ -2,3 +2,5 @@
 # OpenCV build tree and install prefix, produced by crates/opencv-vendored
 /third_party/_build
 /third_party/_install
+# pages that qqcode-show --html writes here while trying things out
+/*.html
