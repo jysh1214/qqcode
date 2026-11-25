@@ -1,0 +1,69 @@
+qqcode sample text
+==================
+
+This file is something to show with qqcode-show and to read back with qqcode.
+It is short, so that a first try does not take long, and it is text, so that
+what arrives can be looked at: if this sentence is on the other machine as it
+is here, the screen, the camera and the two programs get along.
+
+A file goes from one machine to the other through nothing but light. The
+machine that has it puts it on a screen, as QR codes on a terminal or as a
+matrix of coloured tiles on a web page. The machine that wants it points a
+camera at that screen. There is no cable between the two and no network, and
+the machine with the file never learns whether anybody is looking.
+
+It is not only text that can be sent this way. To the programs a file is a
+row of bytes, and these lines are bytes like any others. The ones below are
+not plain ASCII, and each of their characters takes three bytes:
+
+    這個檔案是用來測試的。把它顯示在螢幕上，用相機拍下來，
+    另一台機器就能把它一個位元組都不差地讀回去。
+
+Every printable character of ASCII, in order:
+
+     !"#$%&'()*+,-./0123456789:;<=>?
+    @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_
+    `abcdefghijklmnopqrstuvwxyz{|}~
+
+Characters that are easily taken for one another, which matters to a program
+that reads text off a picture and not at all to one that reads codes:
+
+    0 O o    1 l I |    5 S s    8 B    2 Z z    rn m    vv w    , . ; :
+
+Numbered lines, so that a piece that is missing or in the wrong place shows:
+
+    line 01  the quick brown fox jumps over the lazy dog  0123456789
+    line 02  the quick brown fox jumps over the lazy dog  1234567890
+    line 03  the quick brown fox jumps over the lazy dog  2345678901
+    line 04  the quick brown fox jumps over the lazy dog  3456789012
+    line 05  the quick brown fox jumps over the lazy dog  4567890123
+    line 06  the quick brown fox jumps over the lazy dog  5678901234
+    line 07  the quick brown fox jumps over the lazy dog  6789012345
+    line 08  the quick brown fox jumps over the lazy dog  7890123456
+    line 09  the quick brown fox jumps over the lazy dog  8901234567
+    line 10  the quick brown fox jumps over the lazy dog  9012345678
+    line 11  pack my box with five dozen liquor jugs      0123456789
+    line 12  pack my box with five dozen liquor jugs      1234567890
+    line 13  pack my box with five dozen liquor jugs      2345678901
+    line 14  pack my box with five dozen liquor jugs      3456789012
+    line 15  pack my box with five dozen liquor jugs      4567890123
+    line 16  pack my box with five dozen liquor jugs      5678901234
+    line 17  pack my box with five dozen liquor jugs      6789012345
+    line 18  pack my box with five dozen liquor jugs      7890123456
+    line 19  pack my box with five dozen liquor jugs      8901234567
+    line 20  pack my box with five dozen liquor jugs      9012345678
+    line 21  how vexingly quick daft zebras jump          0123456789
+    line 22  how vexingly quick daft zebras jump          1234567890
+    line 23  how vexingly quick daft zebras jump          2345678901
+    line 24  how vexingly quick daft zebras jump          3456789012
+    line 25  how vexingly quick daft zebras jump          4567890123
+    line 26  how vexingly quick daft zebras jump          5678901234
+    line 27  how vexingly quick daft zebras jump          6789012345
+    line 28  how vexingly quick daft zebras jump          7890123456
+    line 29  how vexingly quick daft zebras jump          8901234567
+    line 30  how vexingly quick daft zebras jump          9012345678
+
+The programs print the SHA-256 and the MD5 of a file when they end. Those of
+this one are in the README, next to how it is shown.
+
+end of sample.txt

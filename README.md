@@ -360,6 +360,33 @@ The length is a number of 64 bits here; block and sequence say which packet of w
 which follows what it is the sum of; and the check is the CRC-32 of the frame, which keeps a frame that
 was put right wrongly out of the sums, where it would spoil a whole block.
 
+## Files to try it with
+
+`assets/` has two files to show:
+
+| File | Bytes | What | On the web page | On a terminal of 200x60 cells |
+| --- | --- | --- | --- | --- |
+| `assets/sample.txt` | 3758 | text to look at once it has arrived: prose, every printable ASCII character, two lines of Chinese, numbered lines | 1 frame | 5 codes |
+| `assets/sample.bin` | 65536 | every value of a byte in order, then bytes in no order | 7 frames | 78 codes |
+
+```sh
+qqcode-show assets/sample.txt                        # in a terminal that the camera sees
+qqcode-show assets/sample.bin --html sample.html     # or as a page for a browser
+qqcode -o read.bin --preview                         # where the camera is
+```
+
+Both programs end by printing the SHA-256 and the MD5 of the file, which for these two are:
+
+```
+SHA-256 bc0327a4d16248b69456fb72aef5959d37387daa499bcc4daea72128f934bae2    assets/sample.txt
+MD5 1fbf9430aaaca16ce44e1fe6c180f4bc
+SHA-256 d060b80065d3d79686baaf6c41801d46ff93365dd414bd30501029ce5838f061    assets/sample.bin
+MD5 62b80e7f487ffaae9158a421f8defc52
+```
+
+Something longer is quickly made: `head -c 1M /dev/urandom > big.bin` is 105 frames of the page, 7 seconds
+at 15 a second.
+
 ## Tests
 
 `cargo test` needs neither a camera nor a terminal nor a browser: unit tests for the pure logic, the tests
