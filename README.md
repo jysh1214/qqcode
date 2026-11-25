@@ -167,10 +167,18 @@ qqcode-show notes.tar.gz --html show.html --scale 16 --rate 12  # more tiles, fo
 qqcode-show notes.tar.gz --html show.html --shape classic       # for a camera with frames of 4:3
 ```
 
+It says what it wrote, here for `assets/sample.bin`:
+
 ```
-wrote show.html: notes.tar.gz, 3000000 bytes in 298 frames of 10077 bytes, 15 a second: 151 kB a second, 20 s if every frame is read
+wrote show.html: sample.bin, 65536 bytes in 7 frames of 10077 bytes, 15 a second: 151 kB a second, 1 s if every frame is read
 matrix of 176x99 tiles, 1592x899 px: best shown at that size or a whole multiple of it, and filling the frames of the camera
+SHA-256 d060b80065d3d79686baaf6c41801d46ff93365dd414bd30501029ce5838f061
+MD5 62b80e7f487ffaae9158a421f8defc52
+file:///home/me/qqcode/show.html
 ```
+
+The last line is the page as a browser is told to open it, with the whole path from the root: most
+terminals make a link of it, and it can be pasted into the address bar as it is.
 
 The page is one file that loads nothing else and has the file to show inside it, so it is about a third
 larger than that. It can be copied to whatever has the screen. A browser shows the matrix as large as its

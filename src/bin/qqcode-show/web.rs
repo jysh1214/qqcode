@@ -148,7 +148,24 @@ pub fn write(file: &Path, to: &Path, grid: Grid, rate: u32) -> Result<()> {
     println!("{}", summary(to, &name, &bytes, grid, rate));
     println!("SHA-256 {}", qqcode::digest::sha256(&bytes));
     println!("MD5 {}", qqcode::digest::md5(&bytes));
+    // last, and on a line of its own: what a browser is told to open, and what a terminal makes a link of
+    let whole = fs::canonicalize(to).or_else(|_| std::path::absolute(to));
+    println!("{}", address(&whole.unwrap_or_else(|_| to.to_owned())));
     Ok(())
+}
+
+/// The page at `path`, which begins at the root, as a browser is told to open it: `file://` and the path,
+/// with every byte that an address has another use for written as a percent sign and two digits.
+fn address(path: &Path) -> String {
+    let mut address = String::from("file://");
+    for byte in path.as_os_str().as_encoded_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(byte) {
+            address.push(*byte as char);
+        } else {
+            address.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    address
 }
 
 /// What a page that was written holds, and what it asks of the screen and of the camera.
@@ -259,6 +276,41 @@ mod tests {
             Frame::Packet { sequence: 1000, .. }
         ));
         assert_eq!(show.tiles(Some(5)).len(), grid.tiles());
+    }
+
+    #[test]
+    fn page_is_named_as_a_browser_opens_it() {
+        assert_eq!(
+            address(Path::new("/home/me/show.html")),
+            "file:///home/me/show.html"
+        );
+        // a space, a number sign, a question mark and a letter of two bytes
+        assert_eq!(
+            address(Path::new("/tmp/my files/a#b?ü.html")),
+            "file:///tmp/my%20files/a%23b%3F%C3%BC.html"
+        );
+        assert_eq!(address(Path::new("/a-b_c.d~e/100%")), "file:///a-b_c.d~e/100%25");
+    }
+
+    #[test]
+    fn writing_a_page_leaves_it_where_it_was_asked_for() {
+        let dir = std::env::temp_dir().join(format!("qqcode-show-write-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (file, to) = (dir.join("notes.bin"), dir.join("show.html"));
+        fs::write(&file, bytes(1000)).unwrap();
+        write(&file, &to, Grid::new(Shape::Square, 4), 15).unwrap();
+        let written = fs::read_to_string(&to).unwrap();
+        assert_eq!(
+            written,
+            page("notes.bin", &bytes(1000), Grid::new(Shape::Square, 4), 15)
+        );
+        // and the address that is printed is that of the file, from the root
+        let address = address(&fs::canonicalize(&to).unwrap());
+        assert!(
+            address.starts_with("file:///") && address.ends_with("/show.html"),
+            "{address}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
