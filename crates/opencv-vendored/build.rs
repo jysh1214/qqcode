@@ -30,6 +30,19 @@ const ENV_VARS: &[&str] = &[
 
 const STAMP_NAME: &str = "qqcode-build-stamp";
 
+/// Extension of the unversioned shared-library symlink CMake installs, which differs by platform
+/// (`libopencv_core.so` vs. `libopencv_core.dylib`).
+#[cfg(target_os = "macos")]
+const SHARED_LIB_EXT: &str = "dylib";
+#[cfg(not(target_os = "macos"))]
+const SHARED_LIB_EXT: &str = "so";
+
+/// What the dynamic loader replaces with the directory of the library that is being loaded.
+#[cfg(target_os = "macos")]
+const RPATH_ORIGIN: &str = "@loader_path";
+#[cfg(not(target_os = "macos"))]
+const RPATH_ORIGIN: &str = "$ORIGIN";
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let third_party = manifest_dir
@@ -60,7 +73,11 @@ fn main() {
 
     let lib_dir = prefix.join("lib");
     let libs = installed_libs(&lib_dir);
-    assert!(!libs.is_empty(), "no libopencv_*.so in {}", lib_dir.display());
+    assert!(
+        !libs.is_empty(),
+        "no libopencv_*.{SHARED_LIB_EXT} in {}",
+        lib_dir.display()
+    );
     println!("cargo::metadata=root={}", prefix.display());
     println!(
         "cargo::metadata=include={}",
@@ -99,7 +116,7 @@ fn cmake_args(opencv_src: &Path, prefix: &Path) -> Vec<String> {
         format!("-DCMAKE_INSTALL_PREFIX={}", prefix.display()),
         "-DCMAKE_INSTALL_LIBDIR=lib".to_string(),
         // the installed libraries find each other, and keep finding an FFmpeg in a non-default location
-        "-DCMAKE_INSTALL_RPATH=$ORIGIN".to_string(),
+        format!("-DCMAKE_INSTALL_RPATH={RPATH_ORIGIN}"),
         "-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON".to_string(),
         format!("-DBUILD_LIST={}", MODULES.join(",")),
     ];
@@ -212,17 +229,20 @@ fn summary_says_yes(summary: &str, key: &str) -> bool {
     })
 }
 
-/// Names (without `lib` / `.so`) of the installed OpenCV libraries.
+/// Names (without `lib` / the shared-library extension) of the installed OpenCV libraries.
 fn installed_libs(lib_dir: &Path) -> Vec<String> {
+    let suffix = format!(".{SHARED_LIB_EXT}");
     let mut libs = fs::read_dir(lib_dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
-            Some(name.strip_prefix("lib")?.strip_suffix(".so")?.to_string())
+            Some(name.strip_prefix("lib")?.strip_suffix(&suffix)?.to_string())
         })
-        .filter(|name| name.starts_with("opencv_"))
+        // macOS has the version in front of the extension (`libopencv_core.4.15.0.dylib`), which would list
+        // every library three times
+        .filter(|name| name.starts_with("opencv_") && !name.contains('.'))
         .collect::<Vec<_>>();
     libs.sort();
     libs
