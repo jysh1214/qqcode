@@ -471,8 +471,15 @@ fn pattern_of(likeness: &[i32; 8], strength: &[f32; 8]) -> usize {
         .expect("eight patterns")
 }
 
+/// How much less of a channel the tiles of one colour have than the others, at the least, for a frame to
+/// be taken at its word about where its colours are.
+const APART: f32 = 0.2;
+
 /// Which of the four colours each tint is. The colours are those of the page as a camera sees them, which
-/// is not as they are on the page: so the four are first taken as they ought to be and then moved, a few
+/// is not as they are on the page: one camera has two thirds of the red in a cyan tile that it has in the
+/// white tile next to it. So the four begin where this frame has them, as far as it shows that: a channel
+/// that the tiles have in two [`groups`] says how much of it white has, and how much the colour that
+/// lacks it. Where a channel says nothing, they begin as they ought to be. They are then moved, a few
 /// times over, to the middle of the tints that are nearest to each.
 fn classify(tints: &[[f32; 3]]) -> Vec<u8> {
     // blue, green, red, as the frame has them
@@ -490,7 +497,15 @@ fn classify(tints: &[[f32; 3]]) -> Vec<u8> {
             .min_by(|a, b| off(&centres[*a as usize]).total_cmp(&off(&centres[*b as usize])))
             .expect("four colours")
     };
-    let mut centres = pure;
+    let mut begin = pure;
+    for channel in 0..3 {
+        if let Some((faint, full)) = groups(tints.iter().map(|tint| tint[channel]).collect()) {
+            for colour in 0..4 {
+                begin[colour][channel] = if pure[colour][channel] == 0.0 { faint } else { full };
+            }
+        }
+    }
+    let mut centres = begin;
     for _ in 0..4 {
         let mut sums = [[0f32; 3]; 4];
         let mut counts = [0usize; 4];
@@ -507,7 +522,7 @@ fn classify(tints: &[[f32; 3]]) -> Vec<u8> {
                 let moved = sums[colour].map(|sum| sum / counts[colour] as f32);
                 let off = moved
                     .iter()
-                    .zip(&pure[colour])
+                    .zip(&begin[colour])
                     .map(|(a, b)| (a - b) * (a - b))
                     .sum::<f32>();
                 // and none goes over to where another one belongs
@@ -518,6 +533,26 @@ fn classify(tints: &[[f32; 3]]) -> Vec<u8> {
         }
     }
     tints.iter().map(|tint| nearest(&centres, tint)).collect()
+}
+
+/// The two groups that the tiles are in by how much they have of one channel, if they are in two: the
+/// middle of those that have little of it and of those that have all of it, at least [`APART`] from each
+/// other. The groups are those on either side of the middle between the ends, less a twentieth of the
+/// tiles at each end, which may be anything; a colour that hardly any tile has is no group.
+fn groups(mut values: Vec<f32>) -> Option<(f32, f32)> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable_by(f32::total_cmp);
+    let at = |share: f32| values[((values.len() - 1) as f32 * share).round() as usize];
+    let between = (at(0.05) + at(0.95)) / 2.0;
+    let (faint, full) = values.split_at(values.partition_point(|value| *value < between));
+    if faint.len() < 16 || full.len() < 16 {
+        return None;
+    }
+    let middle = |of: &[f32]| of.iter().sum::<f32>() / of.len() as f32;
+    let (faint, full) = (middle(faint), middle(full));
+    (full - faint >= APART).then_some((faint, full))
 }
 
 #[cfg(test)]
@@ -768,6 +803,65 @@ mod tests {
             .filter(|tile| colours[*tile] as usize != tile % 4)
             .count();
         assert_eq!(wrong, 0);
+    }
+
+    #[test]
+    fn colours_are_told_apart_that_are_all_nearer_to_white_than_to_what_they_are() {
+        // As a webcam had them off a laptop's screen: two thirds of the red in a cyan tile that a white
+        // one has, and half of what magenta and yellow lack. Each has its tiles around that, cyan from
+        // 0.54 to 0.78 of red, which is nearer to white as the page has it for every one of them.
+        let seen = |tile: usize| {
+            let around = 0.12 * ((tile / 4 % 25) as f32 / 24.0 - 0.5);
+            match tile % 4 {
+                0 => [0.94 + around, 0.95, 0.97 - around.abs()],
+                1 => [0.96, 0.97, 0.66 + 2.0 * around],
+                2 => [0.97, 0.53 + 2.0 * around, 0.94],
+                _ => [0.53 + 2.0 * around, 0.94, 0.99],
+            }
+        };
+        let tints = (0..2000).map(seen).collect::<Vec<_>>();
+        let colours = classify(&tints);
+        let wrong = (0..2000)
+            .filter(|tile| colours[*tile] as usize != tile % 4)
+            .count();
+        assert_eq!(wrong, 0);
+        // with a colour that the frame has no tile of, the others are found all the same
+        let three = (0..2000)
+            .filter(|tile| tile % 4 != 3)
+            .map(|tile| (tile % 4, seen(tile)))
+            .collect::<Vec<_>>();
+        let colours = classify(&three.iter().map(|(_, tint)| *tint).collect::<Vec<_>>());
+        assert!(
+            three
+                .iter()
+                .zip(&colours)
+                .all(|((is, _), read)| *is == *read as usize)
+        );
+    }
+
+    #[test]
+    fn channel_is_in_two_groups_only_if_they_are_apart() {
+        let spread = |middle: f32, wide: f32, count: usize| {
+            (0..count).map(move |at| middle + wide * (at as f32 / (count - 1) as f32 - 0.5))
+        };
+        // a quarter of the tiles lack a third of the channel
+        let two = spread(0.66, 0.2, 100)
+            .chain(spread(0.97, 0.1, 300))
+            .collect::<Vec<_>>();
+        let (faint, full) = groups(two).expect("two groups");
+        assert!(
+            (faint - 0.66).abs() < 0.01 && (full - 0.97).abs() < 0.01,
+            "{faint} {full}"
+        );
+        // tiles that all have the channel, some more of it and some less, are one group
+        assert_eq!(groups(spread(0.9, 0.3, 400).collect()), None);
+        assert_eq!(groups(vec![0.1; 50]), None);
+        assert_eq!(groups(Vec::new()), None);
+        // and a dozen tiles of garbage are none
+        let few = spread(0.1, 0.1, 12)
+            .chain(spread(0.97, 0.1, 388))
+            .collect::<Vec<_>>();
+        assert_eq!(groups(few), None);
     }
 
     #[test]
