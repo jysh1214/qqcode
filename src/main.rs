@@ -23,7 +23,7 @@ use qqcode::digest::{self, Digests};
 use qqcode::packet::Origin;
 use qqcode::protocol::Checksum;
 use qqcode::scan::{Found, Scanner};
-use qqcode::{Outcome, Pipeline};
+use qqcode::{Kind, Outcome, Pipeline, Survey};
 
 use preview::Preview;
 
@@ -166,6 +166,8 @@ fn main() -> Result<()> {
     let mut file = None;
     let (mut frame_rate, mut frame_at) = (0.0, Instant::now());
     let (mut told_at, mut drawn_at) = (Instant::now(), None::<Instant>);
+    // for the preview: how fast the file arrives, and the codes that were read last
+    let (mut pace, mut steady) = (Pace::default(), Steady::default());
     // what was found in frames that came back before an earlier one
     let mut early: BTreeMap<u64, (Mat, Vec<Found>)> = BTreeMap::new();
     'frames: for (number, frame, codes) in found {
@@ -263,6 +265,8 @@ fn main() -> Result<()> {
                 0.9 * frame_rate + 0.1 * rate
             };
             frame_at = now;
+            pace.take(now, pipeline.received().unwrap_or(0));
+            steady.take(pipeline.last_survey(), now);
             // the terminal takes its time over a picture: a dozen of them a second are enough to point by
             let due = drawn_at.is_none_or(|at| at.elapsed() >= Duration::from_millis(80)) || done;
             if let Some(preview) = &mut log.preview
@@ -271,14 +275,16 @@ fn main() -> Result<()> {
                 drawn_at = Some(Instant::now());
                 let size = frame.size()?;
                 let facts = format!(
-                    "{}x{} | frame {frames} | {frame_rate:.1} frames a second | {} waiting | {}",
+                    "{}x{} | frame {frames} | {frame_rate:.1} frames a second | {} | {} waiting | {}",
                     size.width,
                     size.height,
+                    pace.say(),
                     buffer.waiting(),
                     progress(&pipeline)
                 );
                 let remark = log.held.last().map_or("", String::as_str);
-                preview.draw(&frame, pipeline.last_survey(), &facts, remark)?;
+                let survey = steady.show(pipeline.last_survey(), now);
+                preview.draw(&frame, survey, &facts, remark)?;
                 if preview.quit_requested()? {
                     log.say(format!("frame {frames}: stopped by a key"));
                     break 'frames;
@@ -593,6 +599,83 @@ fn progress(pipeline: &Pipeline) -> String {
             }
         }
         _ => "no code of qqcode-show read".to_owned(),
+    }
+}
+
+/// The time that [`Pace`] goes by.
+const PACE_OVER: Duration = Duration::from_secs(5);
+
+/// How fast the file arrives: what came of it in the last seconds, over that time. This is what tells
+/// whether another `--scale`, another `--rate` or another place for the camera is for the better: it
+/// counts the frames of the page that are read, each once, and none of those that are not.
+#[derive(Default)]
+struct Pace {
+    /// How much of the file had arrived at a time, from the last time that is [`PACE_OVER`] ago on
+    marks: VecDeque<(Instant, u64)>,
+}
+
+impl Pace {
+    fn take(&mut self, at: Instant, received: u64) {
+        // another file, or this one begun anew: what came before is not of it
+        if self.marks.back().is_some_and(|(_, before)| received < *before) {
+            self.marks.clear();
+        }
+        self.marks.push_back((at, received));
+        while self.marks.len() > 1 && at.duration_since(self.marks[1].0) >= PACE_OVER {
+            self.marks.pop_front();
+        }
+    }
+
+    /// Bytes a second.
+    fn rate(&self) -> f64 {
+        let (Some((from, before)), Some((to, now))) = (self.marks.front(), self.marks.back()) else {
+            return 0.0;
+        };
+        let time = to.duration_since(*from).as_secs_f64();
+        if time > 0.0 {
+            (now - before) as f64 / time
+        } else {
+            0.0
+        }
+    }
+
+    /// `27.4 kB a second`
+    fn say(&self) -> String {
+        format!("{:.1} kB a second", self.rate() / 1000.0)
+    }
+}
+
+/// How long the preview goes on showing the codes of a frame in which one was read while none is read in
+/// the frames after it.
+const HOLD: Duration = Duration::from_millis(500);
+
+/// What the preview shows of the codes in view: those of the frame at hand, or those of the last frame
+/// in which one was read, if that is less than [`HOLD`] ago and none is read in this one.
+///
+/// A camera takes a frame in every few while the page changes, which is read as none and costs nothing,
+/// as the frame before or after it has the same packet. Shown for what it is, every time, that looks like
+/// a page that can't be read, and has whoever points the camera try to mend what is not broken.
+#[derive(Default)]
+struct Steady {
+    read: Option<(Instant, Survey)>,
+}
+
+impl Steady {
+    fn reads(survey: &Survey) -> bool {
+        survey.leading().is_some_and(|code| code.kind != Kind::Unread)
+    }
+
+    fn take(&mut self, survey: &Survey, at: Instant) {
+        if Self::reads(survey) {
+            self.read = Some((at, survey.clone()));
+        }
+    }
+
+    fn show<'a>(&'a self, survey: &'a Survey, at: Instant) -> &'a Survey {
+        match &self.read {
+            Some((then, read)) if !Self::reads(survey) && at.duration_since(*then) < HOLD => read,
+            _ => survey,
+        }
     }
 }
 
@@ -1005,5 +1088,70 @@ mod tests {
         // number that a camera answers with when it is asked for its format, and that it is told.
         assert_eq!(MOTION_JPEG, 1_196_444_237.0);
         assert_eq!(MOTION_JPEG as u32 & 0xff, u32::from(b'M'));
+    }
+
+    #[test]
+    fn pace_is_what_arrived_in_the_last_seconds() {
+        let begin = Instant::now();
+        let at = |seconds: f64| begin + Duration::from_secs_f64(seconds);
+        let mut pace = Pace::default();
+        assert_eq!(pace.say(), "0.0 kB a second");
+        pace.take(at(0.0), 0);
+        assert_eq!(pace.say(), "0.0 kB a second");
+        // a packet of 4000 bytes four times a second
+        for step in 1..=8 {
+            pace.take(at(0.25 * step as f64), 4000 * step);
+        }
+        assert_eq!(pace.say(), "16.0 kB a second");
+        // every other packet missed from here on: half of that, once the five seconds are those
+        for step in 9..=40 {
+            pace.take(at(0.25 * step as f64), 32_000 + 4000 * ((step - 8) / 2));
+        }
+        assert_eq!(pace.say(), "8.0 kB a second");
+        // and frames that bring nothing bring it down to nothing
+        for step in 41..=61 {
+            pace.take(at(0.25 * step as f64), 96_000);
+        }
+        assert_eq!(pace.say(), "0.0 kB a second");
+        // a file that is begun anew is taken from where it begins
+        pace.take(at(16.0), 1000);
+        assert_eq!(pace.say(), "0.0 kB a second");
+        pace.take(at(17.0), 3500);
+        assert_eq!(pace.say(), "2.5 kB a second");
+    }
+
+    #[test]
+    fn preview_keeps_the_codes_that_were_read_while_the_page_changes() {
+        let sight = |kind| Survey {
+            codes: vec![qqcode::Sighting {
+                outline: [opencv::core::Point2f::default(); 4],
+                kind,
+                modules: 80,
+                module_size: 15.0,
+                wrong: Some(0.0),
+            }],
+        };
+        let (read, unread, nothing) = (sight(Kind::Piece), sight(Kind::Unread), Survey::default());
+        let begin = Instant::now();
+        let at = |milliseconds: u64| begin + Duration::from_millis(milliseconds);
+        let mut steady = Steady::default();
+        // while nothing was read yet, a frame is shown as it is
+        steady.take(&unread, at(0));
+        assert_eq!(steady.show(&unread, at(0)), &unread);
+        steady.take(&read, at(100));
+        assert_eq!(steady.show(&read, at(100)), &read);
+        // the frame that is taken while the page changes, and one with nothing in it
+        steady.take(&unread, at(170));
+        assert_eq!(steady.show(&unread, at(170)), &read);
+        assert_eq!(steady.show(&nothing, at(240)), &read);
+        // but a page that is not read for half a second is shown as that
+        assert_eq!(steady.show(&unread, at(599)), &read);
+        assert_eq!(steady.show(&unread, at(600)), &unread);
+        assert_eq!(steady.show(&nothing, at(600)), &nothing);
+        // another code that is read comes at once
+        let other = sight(Kind::Other);
+        steady.take(&other, at(700));
+        assert_eq!(steady.show(&other, at(700)), &other);
+        assert_eq!(steady.show(&unread, at(750)), &other);
     }
 }

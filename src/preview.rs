@@ -1,5 +1,5 @@
 //! A live view for pointing the camera, part of the `qqcode` program only: what the camera sees, drawn on
-//! the terminal out of half block characters, with the codes that are made out in it.
+//! the terminal out of half block characters, with the codes that are read in it.
 //!
 //! It is drawn on the standard error, as the standard output is where the file goes. Nobody else writes
 //! there meanwhile: what OpenCV and the libraries under it have to say is gathered and comes out when
@@ -33,7 +33,9 @@ const TEXT_ROWS: usize = 4;
 /// Colours of the marks in the picture, as blue, green, red.
 const SHOWN: (u8, u8, u8) = (0, 230, 0);
 const OTHER: (u8, u8, u8) = (255, 0, 255);
-const UNREAD: (u8, u8, u8) = (0, 0, 255);
+
+/// The colour of what the lines below the picture say when no code is read.
+const NOTHING: Color = Color::Rgb { r: 255, g: 90, b: 90 };
 
 /// The terminal as a view of the camera, from [`Preview::open`] until it is closed or dropped.
 pub struct Preview {
@@ -238,17 +240,18 @@ fn picture_size(frame: Size, columns: usize, rows: usize, dot_shape: f64) -> Siz
     Size::new(width as i32, height as i32)
 }
 
-/// The colour that a code of this kind is marked in.
-fn mark_of(kind: Kind) -> (u8, u8, u8) {
+/// The colour that a code of this kind is marked in. One that can't be read has no mark: the page of
+/// `qqcode-show` is not read in the frames that a camera takes while it changes, every few frames and to no
+/// harm, and a mark for that tells whoever points the camera that something is wrong.
+fn mark_of(kind: Kind) -> Option<(u8, u8, u8)> {
     match kind {
-        Kind::Start | Kind::Piece | Kind::End => SHOWN,
-        Kind::Other => OTHER,
-        Kind::Unread => UNREAD,
+        Kind::Start | Kind::Piece | Kind::End => Some(SHOWN),
+        Kind::Other => Some(OTHER),
+        Kind::Unread => None,
     }
 }
 
-/// The frame at one pixel a dot, in three channels, with the outlines of the codes that the survey made
-/// out.
+/// The frame at one pixel a dot, in three channels, with the outlines of the codes that the survey read.
 fn picture(frame: &Mat, survey: &Survey, size: Size) -> Result<Mat> {
     let mut picture = Mat::default();
     imgproc::resize(frame, &mut picture, size, 0.0, 0.0, imgproc::INTER_AREA)?;
@@ -263,14 +266,13 @@ fn picture(frame: &Mat, survey: &Survey, size: Size) -> Result<Mat> {
         size.height as f32 / frame.height as f32,
     );
     // what matters most goes on last
-    let mut codes = survey.codes.iter().collect::<Vec<_>>();
-    codes.sort_by_key(|code| match code.kind {
-        Kind::Unread => 0,
-        Kind::Other => 1,
-        Kind::Start | Kind::Piece | Kind::End => 2,
-    });
-    for code in codes {
-        let (blue, green, red) = mark_of(code.kind);
+    let mut codes = survey
+        .codes
+        .iter()
+        .filter_map(|code| Some((code, mark_of(code.kind)?)))
+        .collect::<Vec<_>>();
+    codes.sort_by_key(|(code, _)| code.kind != Kind::Other);
+    for (code, (blue, green, red)) in codes {
         let colour = Scalar::new(blue as f64, green as f64, red as f64, 0.0);
         let outline = &code.outline;
         for (from, to) in outline.iter().zip(outline.iter().cycle().skip(1)) {
@@ -332,14 +334,16 @@ fn colour((blue, green, red): (u8, u8, u8)) -> Color {
 fn status(survey: &Survey, facts: &str, remark: &str) -> Vec<Vec<(Color, String)>> {
     let plain = Color::Reset;
     let code = match survey.leading() {
-        Some(code) => (colour(mark_of(code.kind)), format!("code: {}", describe(code))),
-        None => (Color::Rgb { r: 255, g: 90, b: 90 }, "code: -----".to_owned()),
+        Some(code) => (
+            mark_of(code.kind).map_or(NOTHING, colour),
+            format!("code: {}", describe(code)),
+        ),
+        None => (NOTHING, "code: -----".to_owned()),
     };
     let legend = [
         (plain, "q quits   marks: ".to_owned()),
         (colour(SHOWN), "code of qqcode-show  ".to_owned()),
-        (colour(OTHER), "other QR code  ".to_owned()),
-        (colour(UNREAD), "QR code that can't be read".to_owned()),
+        (colour(OTHER), "other QR code".to_owned()),
     ];
     let remark = if remark.is_empty() {
         legend.to_vec()
@@ -523,7 +527,8 @@ mod tests {
         assert_eq!([at(10, 10), at(30, 10), at(50, 30), at(10, 50)], [SHOWN; 4]);
         assert_eq!(at(30, 30), grey);
         assert_eq!([at(70, 10), at(90, 20)], [OTHER; 2]);
-        assert_eq!([at(70, 50), at(80, 70)], [UNREAD; 2]);
+        // the one that can't be read, from (70, 50) to (90, 70), has no outline
+        assert_eq!([at(70, 50), at(80, 70), at(90, 60)], [grey; 3]);
         Ok(())
     }
 
@@ -563,11 +568,8 @@ mod tests {
         assert_eq!(lines[0], "code: -----");
         assert_eq!(lines[1], "no QR code in view");
         assert_eq!(lines[2], "1920x1080");
-        assert!(
-            lines[3].starts_with("q quits   marks: code of qqcode-show"),
-            "{}",
-            lines[3]
-        );
+        // what can't be read has no mark
+        assert_eq!(lines[3], "q quits   marks: code of qqcode-show  other QR code");
 
         let start = Survey {
             codes: vec![code(Kind::Start, 0.0, 0.0, 801.0)],

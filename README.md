@@ -153,9 +153,16 @@ missed at five frames a second.
 
 To point the camera, `--preview` draws what it sees on the terminal that `qqcode` runs in, a frame at a
 time, as coarse as the terminal has character cells (a smaller font gives a finer picture). In the picture
-a code of `qqcode-show` is outlined in green, any other QR code in magenta, and a QR code that is found but
-can't be decoded in red. The lines below it say what the code in view is, how many modules it has to a side
-and how many pixels of the frame a module gets, what to do about it, and how much of the file has arrived.
+a code of `qqcode-show` that is read is outlined in green and any other QR code in magenta; one that can't be
+read has no outline. The lines below it say what the code in view is, how many modules it has to a side and
+how many pixels of the frame a module gets, what to do about it, how fast the file arrives and how much of
+it has.
+
+How fast is `27.4 kB a second`, over the last five seconds: the number to try another `--scale`, another
+`--rate` or another place for the camera by. A camera takes one frame in every few while the page changes,
+which is read as none and costs nothing, so the preview goes on showing what was read before it, and says
+that a code can't be read once none was for half a second.
+
 Reading goes on as without the preview; what `qqcode` would otherwise write to the terminal while it runs
 is printed when it ends. So is what the libraries under it write there, such as the `Corrupt JPEG data` that
 some cameras get for every frame, with the lines that differ in their numbers only told once. `q` ends it.
