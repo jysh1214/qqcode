@@ -651,9 +651,14 @@ impl Log {
         }
     }
 
-    /// Ends the preview, if there is one, and prints what was said meanwhile.
+    /// Ends the preview, if there is one, and prints what was said meanwhile: by the libraries, which
+    /// the preview kept off the terminal, and here.
     fn close(&mut self) {
-        self.preview = None;
+        if let Some(preview) = self.preview.take() {
+            for line in preview.close() {
+                eprintln!("{line}");
+            }
+        }
         for remark in self.held.drain(..) {
             eprintln!("{remark}");
         }

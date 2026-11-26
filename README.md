@@ -157,8 +157,9 @@ a code of `qqcode-show` is outlined in green, any other QR code in magenta, and 
 can't be decoded in red. The lines below it say what the code in view is, how many modules it has to a side
 and how many pixels of the frame a module gets, what to do about it, and how much of the file has arrived.
 Reading goes on as without the preview; what `qqcode` would otherwise write to the terminal while it runs
-is printed when it ends. `q` ends it. The preview is drawn through the standard error, which leaves the
-standard output to the file.
+is printed when it ends. So is what the libraries under it write there, such as the `Corrupt JPEG data` that
+some cameras get for every frame, with the lines that differ in their numbers only told once. `q` ends it.
+The preview is drawn through the standard error, which leaves the standard output to the file.
 
 ## The web page
 

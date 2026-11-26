@@ -19,6 +19,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # drawing on the terminal and reading its keys
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
+# puts the standard error aside while the preview has the terminal; crossterm brings the crate along anyway
+rustix = { version = "1", default-features = false, features = ["std", "stdio"] }
 # Bindings for the OpenCV that `opencv-vendored` builds from third_party/opencv (see third_party/README.md)
 # "clang-runtime": the build script looks libclang up when it runs instead of linking against it, so a
 # libclang outside the dynamic loader's search path works too

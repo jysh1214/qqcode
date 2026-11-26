@@ -678,6 +678,7 @@ dependencies = [
  "opencv",
  "opencv-vendored",
  "qrcode",
+ "rustix",
  "rxing",
  "sha2",
  "unicode-width",

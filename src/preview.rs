@@ -1,9 +1,15 @@
 //! A live view for pointing the camera, part of the `qqcode` program only: what the camera sees, drawn on
 //! the terminal out of half block characters, with the codes that are made out in it.
 //!
-//! It is drawn on the standard error, as the standard output is where the file goes.
+//! It is drawn on the standard error, as the standard output is where the file goes. Nobody else writes
+//! there meanwhile: what OpenCV and the libraries under it have to say is gathered and comes out when
+//! the preview is closed.
 
-use std::io::{self, IsTerminal, Write};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::os::fd::AsFd;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -29,23 +35,46 @@ const SHOWN: (u8, u8, u8) = (0, 230, 0);
 const OTHER: (u8, u8, u8) = (255, 0, 255);
 const UNREAD: (u8, u8, u8) = (0, 0, 255);
 
-/// The terminal as a view of the camera, from [`Preview::open`] until this is dropped.
+/// The terminal as a view of the camera, from [`Preview::open`] until it is closed or dropped.
 pub struct Preview {
-    out: io::Stderr,
+    /// Keeps everybody else off the terminal, which is where the standard error went
+    aside: Aside,
 }
 
 impl Preview {
     pub fn open() -> Result<Self> {
-        let out = io::stderr();
         ensure!(
-            out.is_terminal(),
+            io::stderr().is_terminal(),
             "--preview draws on the terminal through the standard error, which can't be redirected then"
         );
+        let aside = Aside::begin().context("can't put the standard error aside")?;
         terminal::enable_raw_mode().context("can't take over the terminal")?;
         // from here on `Drop` undoes what was done, also when the next step fails
-        let mut preview = Self { out };
-        execute!(preview.out, EnterAlternateScreen, DisableLineWrap, Hide)?;
+        let mut preview = Self { aside };
+        execute!(preview.aside.before, EnterAlternateScreen, DisableLineWrap, Hide)?;
         Ok(preview)
+    }
+
+    /// Gives the terminal back. Returns what others wrote to the standard error while the preview had it,
+    /// as [`fold`] has it.
+    pub fn close(mut self) -> Vec<String> {
+        self.give_back()
+    }
+
+    fn give_back(&mut self) -> Vec<String> {
+        if self.aside.ended() {
+            return Vec::new();
+        }
+        // nothing more can be done about a terminal that doesn't take these
+        let _ = execute!(
+            self.aside.before,
+            ResetColor,
+            EnableLineWrap,
+            Show,
+            LeaveAlternateScreen
+        );
+        let _ = terminal::disable_raw_mode();
+        self.aside.end()
     }
 
     /// Shows a frame with what `survey` made out in it. `facts` and `remark` are lines of text to put
@@ -78,8 +107,8 @@ impl Preview {
             }
         }
         queue!(out, ResetColor, EndSynchronizedUpdate)?;
-        self.out.write_all(&out)?;
-        self.out.flush()?;
+        self.aside.before.write_all(&out)?;
+        self.aside.before.flush()?;
         Ok(())
     }
 
@@ -101,10 +130,99 @@ impl Preview {
 
 impl Drop for Preview {
     fn drop(&mut self) {
-        // nothing more can be done about a terminal that doesn't take these
-        let _ = execute!(self.out, ResetColor, EnableLineWrap, Show, LeaveAlternateScreen);
-        let _ = terminal::disable_raw_mode();
+        self.give_back();
     }
+}
+
+/// The standard error put aside, from [`Aside::begin`] until [`Aside::end`]: what is written to it is
+/// gathered instead of going where it went.
+///
+/// The preview needs that because the libraries write there as they please, and a line of theirs below
+/// the picture moves all of it up a row until it is drawn again. libjpeg has one for every frame of a
+/// camera whose JPEG has bytes too many: `Corrupt JPEG data: 2 extraneous bytes before marker 0xd3`.
+struct Aside {
+    /// Where the standard error went, and goes again afterwards
+    before: File,
+    /// Reads what is written meanwhile; `None` once that is over
+    gathered: Option<JoinHandle<Vec<String>>>,
+}
+
+impl Aside {
+    fn begin() -> Result<Self> {
+        let before = File::from(io::stderr().as_fd().try_clone_to_owned()?);
+        let (reader, writer) = io::pipe()?;
+        let gathered = thread::spawn(move || gather(reader));
+        // the standard error is the one way into the pipe once `writer` is dropped
+        rustix::stdio::dup2_stderr(&writer)?;
+        Ok(Self {
+            before,
+            gathered: Some(gathered),
+        })
+    }
+
+    fn ended(&self) -> bool {
+        self.gathered.is_none()
+    }
+
+    /// Puts the standard error back where it went and returns what was written to it meanwhile, as
+    /// [`fold`] has it. Nothing the second time.
+    fn end(&mut self) -> Vec<String> {
+        let Some(gathered) = self.gathered.take() else {
+            return Vec::new();
+        };
+        // the reading ends when nothing leads into the pipe any more, so there is no waiting for it if
+        // the standard error could not be taken off it
+        match rustix::stdio::dup2_stderr(&self.before) {
+            Ok(()) => gathered.join().unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl Drop for Aside {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// Reads lines until there is nothing more to read and returns them as [`fold`] has them.
+fn gather(from: impl io::Read) -> Vec<String> {
+    let lines = BufReader::new(from)
+        .split(b'\n')
+        .map_while(Result::ok)
+        .map(|line| String::from_utf8_lossy(&line).into_owned());
+    fold(lines)
+}
+
+/// The lines without the empty ones, and those that differ in their numbers only as one: the first of
+/// them, with how many more there were. A camera can have a line of the same kind for every frame of a
+/// run of hours.
+fn fold(lines: impl Iterator<Item = String>) -> Vec<String> {
+    // the first line of every kind in the order they came, with how many more of the kind followed
+    let mut kinds: Vec<(String, u64)> = Vec::new();
+    let mut places: HashMap<String, usize> = HashMap::new();
+    for line in lines {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let kind = line.chars().filter(|c| !c.is_ascii_digit()).collect::<String>();
+        match places.get(&kind) {
+            Some(&place) => kinds[place].1 += 1,
+            None => {
+                places.insert(kind, kinds.len());
+                kinds.push((line.to_owned(), 0));
+            }
+        }
+    }
+    kinds
+        .into_iter()
+        .map(|(line, more)| match more {
+            0 => line,
+            1 => format!("{line} (and 1 more line like it)"),
+            more => format!("{line} (and {more} more lines like it)"),
+        })
+        .collect()
 }
 
 /// How many dots (width and height) a frame is shown in: as large as `columns` by `rows` cells allow at
@@ -294,6 +412,76 @@ mod tests {
             module_size: side / 89.0,
             wrong: None,
         }
+    }
+
+    /// What the standard error is at the moment: a terminal, a pipe and a file each have their own.
+    fn standard_error() -> Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let is = File::from(io::stderr().as_fd().try_clone_to_owned()?).metadata()?;
+        Ok((is.dev(), is.ino()))
+    }
+
+    /// The one test that puts the standard error aside: it is that of all the tests, which run at once.
+    #[test]
+    fn standard_error_is_gathered_while_it_is_aside_and_comes_back() -> Result<()> {
+        let before = standard_error()?;
+        let mut aside = Aside::begin()?;
+        assert_ne!(standard_error()?, before);
+        // as a library writes, which the test harness does not catch as it does `eprintln!`
+        let mut out = io::stderr();
+        for number in 0..3 {
+            writeln!(
+                out,
+                "Corrupt JPEG data: {number} extraneous bytes before marker 0xd{number}"
+            )?;
+        }
+        write!(out, "can't open camera by index\n\nlast line, which is not ended")?;
+        // what went there before still does
+        aside.before.flush()?;
+
+        let lines = aside.end();
+        // another test may have had something to say meanwhile
+        for line in [
+            "Corrupt JPEG data: 0 extraneous bytes before marker 0xd0 (and 2 more lines like it)",
+            "can't open camera by index",
+            "last line, which is not ended",
+        ] {
+            assert!(
+                lines.iter().any(|have| have == line),
+                "{line} is not in {lines:?}"
+            );
+        }
+        assert_eq!(standard_error()?, before);
+        assert!(aside.ended() && aside.end().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn lines_that_differ_in_numbers_only_are_told_once() {
+        let fold = |lines: &[&str]| fold(lines.iter().map(|line| line.to_string()));
+        assert_eq!(fold(&[]), Vec::<String>::new());
+        assert_eq!(fold(&["one", "", "two\r", "  "]), ["one", "two"]);
+        // the first of a kind stands for it, where the first of the kind was
+        assert_eq!(
+            fold(&[
+                "Corrupt JPEG data: 2 extraneous bytes before marker 0xd3",
+                "select() timeout.",
+                "Corrupt JPEG data: 12 extraneous bytes before marker 0xd0",
+                "select() timeout.",
+                "Corrupt JPEG data: premature end of data segment",
+                "Corrupt JPEG data: 1 extraneous bytes before marker 0xd9",
+            ]),
+            [
+                "Corrupt JPEG data: 2 extraneous bytes before marker 0xd3 (and 2 more lines like it)",
+                "select() timeout. (and 1 more line like it)",
+                "Corrupt JPEG data: premature end of data segment",
+            ]
+        );
+        // bytes that are no text are no reason to stop
+        assert_eq!(
+            gather(&b"caf\xe9 1\ncaf\xe9 2\nend"[..]),
+            ["caf\u{fffd} 1 (and 1 more line like it)", "end"]
+        );
     }
 
     #[test]
