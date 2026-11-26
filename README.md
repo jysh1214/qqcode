@@ -80,6 +80,7 @@ qqcode 'frame_%04d.png' > notes.tar.gz                 # or pictures of it
 | --- | --- | --- |
 | input | `0` | camera index, or a video file, an image or an image sequence |
 | `-o`, `--output` | the standard output | file to write; a file from a web page is put together on disk as it arrives, see [long files](#long-files) |
+| `--check` | | the checksums of the file that is to arrive, which it is held against; see [checksums ahead of the file](#checksums-ahead-of-the-file) |
 | `--camera-size` | `1920x1080` | frame size to ask a camera for, `WIDTHxHEIGHT`; see below |
 | `--preview` | off | show what the camera sees on the terminal, with the codes that are found; see below |
 | `--threads` | one for each processor but one | how many frames are read at a time |
@@ -171,14 +172,18 @@ It says what it wrote, here for `assets/sample.bin`:
 
 ```
 wrote show.html: sample.bin, 65536 bytes in 7 frames of 10077 bytes, 15 a second: 151 kB a second, 1 s if every frame is read
+the first round is 8 frames, 1 s, with 10 sums to spare in a hundred; the rounds after it are sums alone, 1 frame, 1 s each; the file is in the page
 matrix of 176x99 tiles, 1592x899 px: best shown at that size or a whole multiple of it, and filling the frames of the camera
+wrote sample.bin.checksums.txt: the checksums of the file, 1 section of 1048576 bytes at most, for qqcode --check; the SHA-256 of this list is 2986d6267f51f6bd52e624863e0ca3fa79bb9e0e336212cbb415767800d6f39b
 SHA-256 d060b80065d3d79686baaf6c41801d46ff93365dd414bd30501029ce5838f061
 MD5 62b80e7f487ffaae9158a421f8defc52
 file:///home/me/qqcode/show.html
 ```
 
 The last line is the page as a browser is told to open it, with the whole path from the root: most
-terminals make a link of it, and it can be pasted into the address bar as it is.
+terminals make a link of it, and it can be pasted into the address bar as it is. The line before the
+SHA-256 and the MD5 of the file is about a second file that is written next to the page: the
+[checksums of the file](#checksums-ahead-of-the-file) megabyte by megabyte, for `qqcode --check`.
 
 The page is one file that loads nothing else and has the file to show inside it, so it is about a third
 larger than that; the page of a file of more than 64 MB [asks for the file](#long-files) instead. It can be
@@ -197,7 +202,7 @@ follow, `--rate` of them a second, without end. `qqcode` ends by itself when it 
 
 | Option | Default | |
 | --- | --- | --- |
-| `--html` | | file to write the page to |
+| `--html` | | file to write the page to; the [checksums of the file](#checksums-ahead-of-the-file) go next to it, as `NAME.checksums.txt` |
 | `--shape` | `wide` | shape of the matrix: `wide` is 16:9, `classic` 4:3, `square` 1:1; best that of the camera's frames |
 | `--scale` | `11` | size of the matrix, 4 to 24: it has 9 rows of tiles for each |
 | `--rate` | `15` | frames a second, 1 to 60 |
@@ -290,6 +295,63 @@ would, without the pictures in between; the time is that of the show, the first 
 Putting the file together took the reader 13 seconds of all that at most. With frames lost all along, a
 larger `--spare` is the better show: the sums come while their group is on show, and the file is whole
 in one round.
+
+### Checksums ahead of the file
+
+```sh
+qqcode-show disk.img --html show.html                # writes disk.img.checksums.txt next to show.html
+qqcode -o disk.img --check disk.img.checksums.txt    # where the camera is, with that list at hand
+```
+
+A frame that the camera misreads is thrown away by its check, which lets a wrong one through once in four
+thousand million. That is rare, and still not what a file of hours should hang on: one wrong packet makes
+a wrong block, and nothing shows it before all of the file is there and its checksum is wrong, with no
+telling where.
+
+So `qqcode-show --html` writes the checksums of the file next to the page: the SHA-256 of every megabyte
+of it, and of the whole. The megabytes are those of the file, whatever the size of the matrix, so one list
+goes with every page of the file. This is the list of `assets/sample.bin`, which has less than a megabyte:
+
+```
+qqcode checksums 1
+file sample.bin
+length 65536
+crc32 4042d80d
+sha256 d060b80065d3d79686baaf6c41801d46ff93365dd414bd30501029ce5838f061
+section 1048576
+d060b80065d3d79686baaf6c41801d46ff93365dd414bd30501029ce5838f061  0
+```
+
+Every line after `section` is the SHA-256 of a megabyte and where in the file it begins. The list of a
+file of 10 GB has 9537 of them and is 733 kB.
+
+The list has to be where the camera is before the file, and it is worth what it is right. It is a file
+like any other, so it can go the same way first, which takes seconds (`qqcode-show disk.img.checksums.txt
+--html list.html`, `qqcode > disk.img.checksums.txt`). Both programs print the SHA-256 of the list,
+`qqcode-show` when it writes it and `qqcode --check` when it reads it: comparing those two once stands for
+every megabyte of the file.
+
+With `--check`, `qqcode`
+
+- takes no other file than the one that the list names by its length and its CRC-32, and ends with an
+  error at the first frame of another one;
+- with `-o`, holds every megabyte against its checksum as soon as the blocks it lies in are whole, and
+  says how many have theirs as it goes;
+- finds a packet that was misread. A block that is whole goes on taking sums, 16 at most, until its
+  megabytes are known to be right. Each of those sums is a test of the block as it was solved; the tests
+  that fail all miss by the same bytes, and which of them fail is the mark of one packet. That packet is
+  left out and the block made of the others. If no one packet accounts for a megabyte that is wrong, more
+  than one was misread: what there is of its blocks is dropped, and they are read anew from the sums of
+  the rounds that follow;
+- without `-o`, where the file is kept in memory, holds it against the list when it is whole, and starts
+  over if a megabyte is wrong;
+- compares the SHA-256 of the whole file with that of the list before it gives the file its name.
+
+Measured with the file of 1.5 GB as above, three frames in ten lost: the checksums took a second on top of
+the 14 that putting the file together takes, and 20 MB of sums. With one packet in 2000 misread on
+purpose, 157 of them and far more than a camera could manage, 62 were found and left out, 9 times a block
+had more than one and was read anew, and the file was the right one, after 19 rounds of sums where 4 had
+done.
 
 ### What the camera has to manage
 

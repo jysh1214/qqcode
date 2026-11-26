@@ -8,12 +8,15 @@
 //! ([`rs`]).
 //!
 //! A file that the page shows may be far longer than the memory: [`stored`] puts it together on disk.
+//! [`checks`] are the checksums of a file section by section, which go ahead of it as a text and against
+//! which it is held as it arrives.
 //!
 //! `qqcode` looks for either in the frames of a camera ([`scan`], and [`sight`] for the matrix), and
 //! [`Pipeline`] takes in what is found until the file is whole. Either program ends by printing the
 //! SHA-256 and the MD5 of the file ([`digest`]).
 
 pub mod assembly;
+pub mod checks;
 pub mod code;
 pub mod digest;
 pub mod fountain;

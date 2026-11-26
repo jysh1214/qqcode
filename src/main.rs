@@ -11,13 +11,14 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::Parser;
 use opencv::core::{Mat, Size};
 use opencv::prelude::*;
 use opencv::videoio;
 
 use qqcode::assembly::Assembly;
+use qqcode::checks::Checks;
 use qqcode::digest::{self, Digests};
 use qqcode::packet::Origin;
 use qqcode::protocol::Checksum;
@@ -46,6 +47,13 @@ struct Cli {
     /// in one piece at the end: a file that is larger than the memory needs this
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
+
+    /// The checksums of the file that is to arrive, as `qqcode-show --html` writes them next to its
+    /// page (NAME.checksums.txt). No other file is taken, and every megabyte of the file is held against
+    /// its checksum: with -o as soon as it has arrived, where a packet that was misread is found and
+    /// left out, and without -o when the file is whole
+    #[arg(long, value_name = "FILE")]
+    check: Option<PathBuf>,
 
     /// Frame size to ask a camera for, which gives the nearest one it has [default: 1920x1080]
     #[arg(long, value_parser = parse_size, value_name = "WIDTHxHEIGHT")]
@@ -84,6 +92,28 @@ fn main() -> Result<()> {
         "the file goes to the standard output, which is this terminal: send it to a file (qqcode > FILE) or \
          name one with -o"
     );
+    // The checksums are read before anything else: a list that is damaged is no use for a show that
+    // takes hours.
+    let checks = match &cli.check {
+        Some(path) => {
+            let list = path.display();
+            let text = fs::read(path).with_context(|| format!("can't read {list}"))?;
+            let checks = Checks::parse(&String::from_utf8_lossy(&text))
+                .map_err(|why| anyhow!("{list} is no list of checksums: {why}"))?;
+            // to be compared with what qqcode-show said when it wrote the list
+            eprintln!(
+                "{list}: the checksums of {}, {} in {}; the SHA-256 of this list is {}",
+                checks.name,
+                count(checks.origin.length as usize, "byte"),
+                count(checks.sections(), "section"),
+                digest::sha256(&text)
+            );
+            Some(checks)
+        }
+        None => None,
+    };
+    let sections = checks.as_ref().map(Checks::sections);
+    let sha256 = checks.as_ref().map(|checks| checks.sha256.clone());
     let capture = open(&cli.input, cli.camera_size)?;
     // a camera goes on whatever becomes of its frames, a file can wait
     let live = cli.input.parse::<i32>().is_ok();
@@ -126,6 +156,9 @@ fn main() -> Result<()> {
         Some(store) => Pipeline::storing(&store.part, &store.sums),
         None => Pipeline::new(),
     };
+    if let Some(checks) = checks {
+        pipeline = pipeline.checked(checks);
+    }
     let mut done = false;
     let (mut frames, mut unread) = (0u64, 0u64);
     // the screen of qqcode-show that the last frame with one of its codes showed
@@ -140,7 +173,13 @@ fn main() -> Result<()> {
         while let Some((frame, codes)) = early.remove(&(frames + 1)) {
             frames += 1;
             let files_before = pipeline.files();
-            let outcome = pipeline.take(codes).with_context(|| format!("frame {frames}"))?;
+            // on one line, as everything that is said of a frame
+            let outcome = pipeline
+                .take(codes)
+                .map_err(|error| anyhow!("frame {frames}: {error:#}"))?;
+            for note in pipeline.take_notes() {
+                log.say(format!("frame {frames}: {note}"));
+            }
             if files_before > 0 && pipeline.files() > files_before {
                 log.say(format!(
                     "frame {frames}: the codes of another file, which is the one that is read from here on"
@@ -205,8 +244,8 @@ fn main() -> Result<()> {
                 Outcome::Corrupt => {
                     screen = None;
                     log.say(format!(
-                        "frame {frames}: all of the file has arrived and its checksum is wrong, so something \
-                         was misread: starting over with what is still on show"
+                        "frame {frames}: all of the file has arrived and is not what its checksums say, so \
+                         something was misread: starting over with what is still on show"
                     ));
                 }
                 Outcome::Complete => {
@@ -272,7 +311,7 @@ fn main() -> Result<()> {
         let (written, to, digests) = match store {
             Some(store) => {
                 let to = store.path.display().to_string();
-                let (written, digests) = store.finish(origin, file)?;
+                let (written, digests) = store.finish(origin, file, sha256.as_deref())?;
                 (written, to, digests)
             }
             None => {
@@ -291,6 +330,14 @@ fn main() -> Result<()> {
             format!("{written} bytes")
         };
         eprintln!("{frames} frames read, {bytes} written to {to}");
+        if let (Some(sections), Some(list)) = (sections, &cli.check) {
+            let all = match sections {
+                0 => "it is the file without a byte that they name".to_owned(),
+                1 => "its one section has its checksum".to_owned(),
+                sections => format!("each of its {sections} sections has its checksum"),
+            };
+            eprintln!("held against {}: {all}", list.display());
+        }
         // to be compared with what qqcode-show prints, or sha256sum and md5sum where the file comes from
         eprintln!("SHA-256 {}", digests.0);
         eprintln!("MD5 {}", digests.1);
@@ -343,9 +390,14 @@ impl Store {
 
     /// Ends the writing of a file that is whole. `kept` is the file if it was kept in memory, which is
     /// checked already. A file that was put together on disk is read once more, for its checksum and its
-    /// length, which have to be those of `origin`. Returns how many bytes the file has, and its SHA-256
-    /// and MD5.
-    fn finish(self, origin: Origin, kept: Option<Vec<u8>>) -> Result<(u64, (String, String))> {
+    /// length, which have to be those of `origin`, and for its SHA-256, which has to be `sha256` if the
+    /// checksums of the file are at hand. Returns how many bytes the file has, and its SHA-256 and MD5.
+    fn finish(
+        self,
+        origin: Origin,
+        kept: Option<Vec<u8>>,
+        sha256: Option<&str>,
+    ) -> Result<(u64, (String, String))> {
         let part = self.part.display().to_string();
         let digests = match kept {
             Some(file) => {
@@ -373,7 +425,13 @@ impl Store {
                     "the file that was put together has not the length and the checksum that its frames name: \
                      it is left as {part}"
                 );
-                digests.finish()
+                let digests = digests.finish();
+                ensure!(
+                    sha256.is_none_or(|sha256| sha256 == digests.0),
+                    "the file that was put together has not the SHA-256 that its checksums name: it is left \
+                     as {part}"
+                );
+                digests
             }
         };
         fs::rename(&self.part, &self.path)
@@ -525,9 +583,13 @@ fn progress(pipeline: &Pipeline) -> String {
     match (pipeline.received(), pipeline.file()) {
         (Some(received), Some(file)) => {
             let bytes = format!("{received} of {}", count(file.length as usize, "byte"));
-            match pipeline.packets() {
+            let packets = match pipeline.packets() {
                 Some((held, needed)) => format!("{bytes}, {held} of {needed} packets"),
                 None => bytes,
+            };
+            match pipeline.sound() {
+                Some((sound, sections)) => format!("{packets}, {sound} of {sections} sections checked"),
+                None => packets,
             }
         }
         _ => "no code of qqcode-show read".to_owned(),

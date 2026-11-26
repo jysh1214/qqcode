@@ -34,7 +34,8 @@ impl Digests {
     }
 }
 
-fn hex(digest: &[u8]) -> String {
+/// Bytes in hexadecimal, two digits each.
+pub fn hex(digest: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

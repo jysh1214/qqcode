@@ -12,10 +12,12 @@ use opencv::core::{self, CV_8UC3, Mat, Point2f, Rect, Scalar, Size, Vector};
 use opencv::prelude::*;
 use opencv::{imgcodecs, imgproc};
 
+use qqcode::checks::{Checks, Note};
 use qqcode::code::{self, Level};
 use qqcode::fountain::{Encoder, Schedule};
 use qqcode::packet::{Frame, OVERHEAD, Origin};
 use qqcode::protocol::{FileId, Message};
+use qqcode::scan::{Content, Found};
 use qqcode::tiles::{self, Grid};
 use qqcode::{Kind, Outcome, Pipeline, digest};
 
@@ -480,6 +482,141 @@ fn file_of_a_web_page_is_put_together_on_disk() -> Result<()> {
     Ok(())
 }
 
+/// What a scanner makes of a frame of the page that a camera sees without a fault.
+fn found(frame: Frame) -> Vec<Found> {
+    vec![Found {
+        outline: [Point2f::new(0.0, 0.0); 4],
+        modules: GRID.columns,
+        content: Content::Matrix {
+            frame: Some(frame),
+            wrong: 0.0,
+        },
+    }]
+}
+
+#[test]
+fn file_on_disk_is_held_against_its_checksums_and_a_misread_packet_is_left_out() -> Result<()> {
+    // eight packets of 5265 bytes, in eight sections of 5000
+    let file = bytes(40_000, 16);
+    let dir = scratch("checked");
+    let (part, sums) = (dir.join("read.part"), dir.join("read.part.sums"));
+    let checks = Checks::in_sections("notes.bin", &file, 5000);
+    let mut pipeline = Pipeline::storing(&part, &sums).checked(checks);
+    assert_eq!(show_page(&mut pipeline, &file, None)?, Outcome::Ready);
+    assert_eq!(pipeline.sound(), None);
+    // Every frame arrives, and of the third the camera misreads four bytes, which the check of a frame
+    // lets through once in a long while: here it is made up.
+    for frame in 0..8 {
+        let mut frame = page_frame(&file, Some(frame));
+        if let Frame::Packet {
+            sequence: 2, bytes, ..
+        } = &mut frame
+        {
+            bytes[10..14].iter_mut().for_each(|byte| *byte ^= 0xff);
+        }
+        assert_eq!(pipeline.take(found(frame))?, Outcome::Packet { new: true });
+    }
+    // The file is all there, and the section from byte 10000 on, which has those four bytes, is not
+    // what it should be: the file is not whole yet.
+    assert_eq!(pipeline.sound(), Some((7, 8)));
+    assert_eq!(
+        pipeline.take_notes(),
+        [Note::Doubted {
+            section: 2,
+            from: 10_000
+        }]
+    );
+    assert_ne!(fs::read(&part)?, file);
+    // the sums that the page shows next tell which packet it was
+    let mut outcome = Outcome::NoCode;
+    for frame in 8..24 {
+        outcome = show_page(&mut pipeline, &file, Some(frame))?;
+        if outcome == Outcome::Complete {
+            break;
+        }
+    }
+    assert_eq!(outcome, Outcome::Complete);
+    assert_eq!(
+        pipeline.take_notes(),
+        [Note::Mended {
+            section: 2,
+            from: 10_000
+        }]
+    );
+    assert_eq!(fs::read(&part)?, file);
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[test]
+fn no_other_file_is_taken_than_the_one_that_the_checksums_are_of() -> Result<()> {
+    let (file, other) = (bytes(20_000, 17), bytes(20_000, 18));
+    let mut pipeline = Pipeline::new().checked(Checks::of("notes.bin", &file));
+    // a QR code that is not of qqcode-show is none of any file
+    let other_code = photograph(&screen(b"https://example.org")?)?;
+    assert_eq!(pipeline.process(&other_code)?, Outcome::Other);
+    // the web page of another file, and its QR codes
+    let error = show_page(&mut pipeline, &other, None).unwrap_err().to_string();
+    let expected = format!(
+        "the file on show has 20000 bytes and the CRC-32 {:08x}, and the checksums are those of \"notes.bin\", \
+         a file of 20000 bytes with the CRC-32 {:08x}",
+        Origin::of(&other).checksum,
+        Origin::of(&file).checksum
+    );
+    assert_eq!(error, expected);
+    let error = pipeline.process(&frame(&show(&other, "other")[0])?).unwrap_err();
+    assert_eq!(error.to_string(), expected);
+    // the file itself is taken, and whole when it has arrived
+    assert_eq!(show_page(&mut pipeline, &file, None)?, Outcome::Ready);
+    for frame in 0..4 {
+        show_page(&mut pipeline, &file, Some(frame))?;
+    }
+    assert_eq!(pipeline.take_file(), Some(file));
+    assert_eq!(pipeline.take_notes(), []);
+    Ok(())
+}
+
+#[test]
+fn file_in_memory_is_held_against_its_checksums_when_it_is_whole() -> Result<()> {
+    // The checksums of the first two sections change places: the file that arrives is the one they
+    // name, by its length and its CRC-32, and two of its sections are not what they say.
+    let file = bytes(20_000, 19);
+    let text = Checks::in_sections("notes.bin", &file, 8000).to_string();
+    let mut lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
+    let (first, second) = (lines[6][..64].to_owned(), lines[7][..64].to_owned());
+    lines[6].replace_range(..64, &second);
+    lines[7].replace_range(..64, &first);
+    let checks = Checks::parse(&lines.join("\n")).unwrap();
+    // a web page
+    let mut pipeline = Pipeline::new().checked(checks.clone());
+    let mut outcome = Outcome::NoCode;
+    for frame in 0..4 {
+        outcome = show_page(&mut pipeline, &file, Some(frame))?;
+    }
+    assert_eq!(outcome, Outcome::Corrupt);
+    assert_eq!(pipeline.take_file(), None);
+    assert_eq!(pipeline.take_notes(), [Note::Wrong { sections: 2, from: 0 }]);
+    // QR codes
+    let mut pipeline = Pipeline::new().checked(checks);
+    let messages = show(&file[..700], "notes.bin");
+    assert!(
+        pipeline.process(&frame(&messages[1])?).is_err(),
+        "700 bytes are another file"
+    );
+    let mut pipeline = Pipeline::new().checked(Checks::in_sections("notes.bin", &file[..700], 300));
+    let mut outcome = Outcome::NoCode;
+    for message in &messages {
+        outcome = pipeline.process(&frame(message)?)?;
+        if outcome == Outcome::Complete {
+            break;
+        }
+    }
+    assert_eq!(outcome, Outcome::Complete);
+    assert_eq!(pipeline.take_file().as_deref(), Some(&file[..700]));
+    assert_eq!(pipeline.take_notes(), []);
+    Ok(())
+}
+
 #[test]
 fn web_page_is_read_from_any_frames_that_are_enough() -> Result<()> {
     let file = bytes(30_000, 12);
@@ -569,6 +706,76 @@ fn program_reads_the_pictures_of_a_web_page() -> Result<()> {
     );
     assert!(said.ends_with(&end), "{said}");
     fs::remove_file(&output)?;
+
+    // Held against the checksums that qqcode-show writes next to its page, which the program reads
+    // before anything else.
+    let list = dir.join("notes.bin.checksums.txt");
+    let text = Checks::of("notes.bin", &file).to_string();
+    fs::write(&list, &text)?;
+    let checked = |list: &Path, to: Option<&Path>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_qqcode"));
+        command.arg(&input).arg("--check").arg(list);
+        if let Some(to) = to {
+            command.arg("-o").arg(to);
+        }
+        command.output()
+    };
+    let run = checked(&list, Some(&output))?;
+    let said = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{said}");
+    assert_eq!(fs::read(&output)?, file);
+    let begin = format!(
+        "{}: the checksums of notes.bin, 50000 bytes in 1 section; the SHA-256 of this list is {}\n",
+        list.display(),
+        digest::sha256(text.as_bytes())
+    );
+    assert!(said.starts_with(&begin), "{said}");
+    let end = format!(
+        "11 frames read, 50000 bytes written to {}\nheld against {}: its one section has its checksum\n\
+         SHA-256 {}\nMD5 {}\n",
+        output.display(),
+        list.display(),
+        digest::sha256(&file),
+        digest::md5(&file)
+    );
+    assert!(said.ends_with(&end), "{said}");
+    fs::remove_file(&output)?;
+    // the standard output gets the file as before
+    let run = checked(&list, None)?;
+    assert!(run.status.success() && run.stdout == file);
+    // The checksums of another file: nothing of the one on show is taken.
+    let another = dir.join("another.checksums.txt");
+    fs::write(
+        &another,
+        Checks::of("another.bin", &bytes(50_000, 21)).to_string(),
+    )?;
+    let run = checked(&another, Some(&output))?;
+    let said = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        !run.status.success() && !output.exists() && !part.exists(),
+        "{said}"
+    );
+    assert!(
+        said.contains("frame 1: the file on show has 50000 bytes and the CRC-32")
+            && said.contains("and the checksums are those of \"another.bin\", a file of 50000 bytes"),
+        "{said}"
+    );
+    // A list that lost a line, and one that is not there.
+    fs::write(&another, text.replace("length 50000\n", ""))?;
+    let run = checked(&another, Some(&output))?;
+    let said = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success(), "{said}");
+    assert!(
+        said.contains(&format!(
+            "{} is no list of checksums: line 3 is to begin with \"length\"",
+            another.display()
+        )),
+        "{said}"
+    );
+    let run = checked(&dir.join("none.txt"), Some(&output))?;
+    assert!(String::from_utf8_lossy(&run.stderr).contains("can't read"));
+    fs::remove_file(&list)?;
+    fs::remove_file(&another)?;
 
     // without the last frames the file is not whole, and the program says how far it came
     for index in [9, 10, 11, 12] {

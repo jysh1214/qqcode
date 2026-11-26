@@ -11,11 +11,12 @@
 
 use std::fs::{self, File};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use qqcode::digest::Digests;
+use qqcode::checks::{self, Checks};
+use qqcode::digest::{self, Digests};
 use qqcode::fountain::{self, Plan, Schedule};
 use qqcode::packet::{OVERHEAD, Origin};
 use qqcode::protocol::Checksum;
@@ -169,12 +170,14 @@ pub fn page(name: &str, origin: Origin, held: Option<&[u8]>, format: Format) -> 
         .replace("{{FILE}}", &held.map(base64).unwrap_or_default())
 }
 
-/// What a file is, read from beginning to end without keeping it: its checksum and length, and its
-/// SHA-256 and MD5.
-fn identify(file: &Path) -> Result<(Origin, (String, String))> {
+/// What a file is, read from beginning to end without keeping it: its MD5, and its checksums section by
+/// section ([`qqcode::checks`]), which have its length, its CRC-32 and its SHA-256 as well. `name` is
+/// what they call it.
+fn identify(file: &Path, name: &str) -> Result<(Checks, String)> {
     let unreadable = || format!("can't read {}", file.display());
     let mut source = File::open(file).with_context(unreadable)?;
     let (mut checksum, mut digests, mut length) = (Checksum::new(), Digests::default(), 0u64);
+    let mut sections = checks::Maker::new(checks::SECTION);
     let mut piece = vec![0u8; 1 << 20];
     loop {
         let read = source.read(&mut piece).with_context(unreadable)?;
@@ -183,20 +186,30 @@ fn identify(file: &Path) -> Result<(Origin, (String, String))> {
         }
         checksum.update(&piece[..read]);
         digests.update(&piece[..read]);
+        sections.update(&piece[..read]);
         length += read as u64;
     }
     let origin = Origin {
         checksum: checksum.finish(),
         length,
     };
-    Ok((origin, digests.finish()))
+    let (sha256, md5) = digests.finish();
+    Ok((sections.finish(name, origin, &sha256), md5))
 }
 
-/// Writes the page for `file` to `to` and says what is in it. The page holds the file unless that is
-/// longer than [`HELD`] or the page is to `ask` for it.
+/// Where the checksums of the file that a page shows are written: next to the page, under the name of
+/// the file.
+pub fn list_of(page: &Path, name: &str) -> PathBuf {
+    page.with_file_name(format!("{name}.checksums.txt"))
+}
+
+/// Writes the page for `file` to `to`, and next to it the checksums of the file for `qqcode --check`
+/// ([`list_of`]), and says what is in them. The page holds the file unless that is longer than [`HELD`]
+/// or the page is to `ask` for it.
 pub fn write(file: &Path, to: &Path, format: Format, ask: bool) -> Result<()> {
-    let (origin, (sha256, md5)) = identify(file)?;
     let name = file.file_name().unwrap_or_default().to_string_lossy();
+    let (checks, md5) = identify(file, &name)?;
+    let origin = checks.origin;
     let held = if ask || origin.length > HELD {
         None
     } else {
@@ -205,7 +218,18 @@ pub fn write(file: &Path, to: &Path, format: Format, ask: bool) -> Result<()> {
     fs::write(to, page(&name, origin, held.as_deref(), format))
         .with_context(|| format!("can't write {}", to.display()))?;
     println!("{}", summary(to, &name, origin, held.is_some(), format));
-    println!("SHA-256 {sha256}");
+    let (list, text) = (list_of(to, &name), checks.to_string());
+    fs::write(&list, &text).with_context(|| format!("can't write {}", list.display()))?;
+    // what qqcode --check says of the list it is given has to be this, or the list is not the same
+    println!(
+        "wrote {}: the checksums of the file, {} of {} bytes at most, for qqcode --check; the SHA-256 of \
+         this list is {}",
+        list.display(),
+        crate::count(checks.sections(), "section"),
+        checks.section,
+        digest::sha256(text.as_bytes())
+    );
+    println!("SHA-256 {}", checks.sha256);
     println!("MD5 {md5}");
     // last, and on a line of its own: what a browser is told to open, and what a terminal makes a link of
     let whole = fs::canonicalize(to).or_else(|_| std::path::absolute(to));
@@ -256,7 +280,7 @@ fn summary(to: &Path, name: &str, origin: Origin, held: bool, format: Format) ->
         "wrote {}: {name}, {} bytes in {} frames of {packet} bytes, {rate} a second: {} kB a second, {} if \
          every frame is read\n\
          the first round is {} frames, {}, with {} sums to spare in a hundred; the rounds after it are sums \
-         alone, {} frames, {} each; {file}\n\
+         alone, {}, {} each; {file}\n\
          matrix of {}x{} tiles, {}x{} px: best shown at that size or a whole multiple of it, and filling the \
          frames of the camera",
         to.display(),
@@ -267,7 +291,7 @@ fn summary(to: &Path, name: &str, origin: Origin, held: bool, format: Format) ->
         schedule.round(),
         time(schedule.round()),
         format.spare,
-        schedule.again(),
+        crate::count(schedule.again() as usize, "frame"),
         time(schedule.again()),
         grid.columns,
         grid.rows,
@@ -412,14 +436,22 @@ mod tests {
         let square = format(Shape::Square, 4);
         let origin = Origin::of(&bytes(1000));
         // what a file is comes out the same whether it is read at once or piece by piece
-        let (identified, (sha256, md5)) = identify(&file).unwrap();
-        assert_eq!(identified, origin);
-        assert_eq!(sha256, qqcode::digest::sha256(&bytes(1000)));
+        let (identified, md5) = identify(&file, "notes.bin").unwrap();
+        assert_eq!(identified, Checks::of("notes.bin", &bytes(1000)));
+        assert_eq!(identified.origin, origin);
+        assert_eq!(identified.sha256, qqcode::digest::sha256(&bytes(1000)));
         assert_eq!(md5, qqcode::digest::md5(&bytes(1000)));
 
         write(&file, &to, square, false).unwrap();
         let written = fs::read_to_string(&to).unwrap();
         assert_eq!(written, page("notes.bin", origin, Some(&bytes(1000)), square));
+        // next to the page are the checksums of the file, under its name
+        let list = dir.join("notes.bin.checksums.txt");
+        assert_eq!(list_of(&to, "notes.bin"), list);
+        assert_eq!(
+            Checks::parse(&fs::read_to_string(&list).unwrap()),
+            Ok(Checks::of("notes.bin", &bytes(1000)))
+        );
         // and the address that is printed is that of the file, from the root
         let address = address(&fs::canonicalize(&to).unwrap());
         assert!(

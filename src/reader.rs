@@ -5,11 +5,13 @@
 //! of which any that are enough make the file ([`crate::packet`], [`crate::fountain`]).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use opencv::core::Mat;
 
 use crate::assembly::Assembly;
+use crate::checks::{Checks, Note};
 use crate::fountain::Decoder;
 use crate::packet::{Frame, Origin};
 use crate::protocol::{self, Message};
@@ -44,8 +46,9 @@ pub enum Outcome {
     /// The file is whole, [`Pipeline::take_file`] has it. What comes of the same file after it says the
     /// same.
     Complete,
-    /// All of the file has arrived and its checksum is wrong, so something was misread. What was collected
-    /// is dropped, and the file counts from the beginning.
+    /// All of the file has arrived and its checksum is wrong, or those of some of its sections are
+    /// ([`Pipeline::checked`]), so something was misread. What was collected is dropped, and the file
+    /// counts from the beginning.
     Corrupt,
 }
 
@@ -140,6 +143,9 @@ pub struct Pipeline {
     store: Option<(PathBuf, PathBuf)>,
     /// The blocks of a web page that are solved and kept in memory, as far as they reach
     kept: Vec<u8>,
+    /// The checksums of the one file that is taken, see [`Pipeline::checked`]
+    checks: Option<Arc<Checks>>,
+    notes: Vec<Note>,
     survey: Survey,
 }
 
@@ -161,6 +167,17 @@ impl Pipeline {
             store: Some((part.to_owned(), sums.to_owned())),
             ..Self::default()
         }
+    }
+
+    /// Takes no other file than the one that `checks` are of, which makes a frame of another file an
+    /// error, and holds what arrives against them: a file that is put together on disk section by
+    /// section as soon as each is whole, where a packet that was misread is looked for and left out
+    /// ([`crate::stored`]); a file that is kept in memory when all of it has arrived, where sections
+    /// that are wrong make the outcome [`Outcome::Corrupt`]. [`Pipeline::take_notes`] says what was
+    /// found.
+    pub fn checked(mut self, checks: Checks) -> Self {
+        self.checks = Some(Arc::new(checks));
+        self
     }
 
     /// Reads one frame, in grey or with blue, green and red.
@@ -212,6 +229,26 @@ impl Pipeline {
             said = said.or(says);
         }
         self.survey = Survey { codes };
+        let on_show = match &said {
+            Some(Said::Code(message)) => Some(Origin {
+                checksum: message.file().checksum,
+                length: message.file().length as u64,
+            }),
+            Some(Said::Matrix(frame)) => Some(frame.origin()),
+            None => None,
+        };
+        if let (Some(checks), Some(on_show)) = (&self.checks, on_show) {
+            ensure!(
+                checks.origin == on_show,
+                "the file on show has {} bytes and the CRC-32 {:08x}, and the checksums are those of {:?}, a file \
+                 of {} bytes with the CRC-32 {:08x}",
+                on_show.length,
+                on_show.checksum,
+                checks.name,
+                checks.origin.length,
+                checks.origin.checksum
+            );
+        }
         Ok(match said {
             Some(Said::Code(message)) => self.take_message(message),
             Some(Said::Matrix(frame)) => self.take_frame(frame)?,
@@ -327,7 +364,10 @@ impl Pipeline {
                 Some((part, sums)) => {
                     let stored = Stored::create(part, sums, origin.length, origin.checksum, bytes.len())
                         .with_context(|| format!("can't write {}", part.display()))?;
-                    Transfer::Stored(stored)
+                    Transfer::Stored(match &self.checks {
+                        Some(checks) => stored.checked(checks.clone()),
+                        None => stored,
+                    })
                 }
                 None => Transfer::Packets(Decoder::new(origin.length, origin.checksum, bytes.len())),
             });
@@ -337,6 +377,7 @@ impl Pipeline {
                 let new = stored
                     .take(block, sequence, &bytes)
                     .context("can't write the file as it arrives")?;
+                self.notes.extend(stored.take_notes());
                 (new, stored.is_complete())
             }
             Some(Transfer::Packets(decoder)) => {
@@ -369,10 +410,24 @@ impl Pipeline {
         Ok(self.finish(checked))
     }
 
-    /// Ends the collecting of the file: with the file, or with nothing if its checksum is wrong.
+    /// Ends the collecting of the file: with the file, or with nothing if its checksum is wrong or those
+    /// of its sections are.
     fn finish(&mut self, file: Option<Vec<u8>>) -> Outcome {
         self.reached = None;
-        match file {
+        let sound = |bytes: &Vec<u8>| {
+            let Some(checks) = &self.checks else {
+                return true;
+            };
+            let wrong = checks.wrong(bytes);
+            if let Some(first) = wrong.first() {
+                self.notes.push(Note::Wrong {
+                    sections: wrong.len(),
+                    from: checks.range(*first).start,
+                });
+            }
+            wrong.is_empty()
+        };
+        match file.filter(sound) {
             Some(bytes) => {
                 self.whole = true;
                 self.file = Some(bytes);
@@ -403,6 +458,20 @@ impl Pipeline {
             Some(Transfer::Stored(stored)) => Some((stored.held(), stored.plan().symbols())),
             _ => None,
         }
+    }
+
+    /// Of a file that is put together on disk and held against its checksums, how many of its sections
+    /// have theirs and how many it has.
+    pub fn sound(&self) -> Option<(usize, usize)> {
+        match &self.transfer {
+            Some(Transfer::Stored(stored)) => stored.sound(),
+            _ => None,
+        }
+    }
+
+    /// What holding the file against its checksums came to since this was last asked.
+    pub fn take_notes(&mut self) -> Vec<Note> {
+        std::mem::take(&mut self.notes)
     }
 
     /// The file that is on show, going by the code read last.

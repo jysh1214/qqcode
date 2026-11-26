@@ -63,6 +63,13 @@ impl Plan {
     pub fn range(&self, block: usize) -> Range<usize> {
         self.blocks.get(block).cloned().unwrap_or(0..0)
     }
+
+    /// The block that a symbol is in, counted through the file; the last block for a symbol beyond it.
+    pub fn block_of(&self, symbol: usize) -> usize {
+        self.blocks
+            .partition_point(|block| block.end <= symbol)
+            .min(self.blocks.len() - 1)
+    }
 }
 
 /// How many blocks the page shows by turns before it goes on to the next ones.
@@ -533,8 +540,13 @@ mod tests {
             [434, 433, 433]
         );
         assert_eq!((plan.range(1), plan.block(3), plan.range(3)), (434..867, 0, 0..0));
+        assert_eq!(
+            [0, 433, 434, 866, 867, 1299, 5000].map(|symbol| plan.block_of(symbol)),
+            [0, 0, 1, 1, 2, 2, 2]
+        );
         let empty = Plan::new(0, 100);
         assert_eq!((empty.symbols(), empty.blocks(), empty.block(0)), (0, 1, 0));
+        assert_eq!(empty.block_of(0), 0);
         assert_eq!(Plan::new(1, 100).symbols(), 1);
     }
 
