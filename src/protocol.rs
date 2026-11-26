@@ -338,4 +338,19 @@ mod tests {
         assert_eq!(fit_name("grün", 4), "grü");
         assert_eq!(fit_name("grün", 0), "");
     }
+
+    #[test]
+    fn name_from_a_code_has_no_control_characters_beyond_ascii_either() {
+        let mut start = Message::Start {
+            file: FILE,
+            name: String::new(),
+        }
+        .encode();
+        // U+009B begins a command for a terminal as ESC [ does, and U+0085 is a line end
+        start.extend("a\u{9b}2Jb\u{85}c".as_bytes());
+        let Some(Message::Start { name, .. }) = Message::parse(&start) else {
+            panic!("a start message");
+        };
+        assert_eq!(name, "a?2Jb?c");
+    }
 }

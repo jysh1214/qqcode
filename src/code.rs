@@ -205,4 +205,29 @@ mod tests {
         }
         assert_eq!(seen, "lmqhl");
     }
+
+    #[test]
+    fn rows_and_columns_are_not_exchanged() -> Result<()> {
+        // A code with rows and columns exchanged is its mirror image, which looks as much like a code
+        // and which some readers take. One module tells the two apart: it is dark whatever the code
+        // holds, in column 8 and eight rows from the bottom, and where the mirror image has it the code
+        // has a bit of its format, which is as often light as dark.
+        let mut mirrored = Vec::new();
+        for (version, level) in [
+            (1, Level::L),
+            (2, Level::M),
+            (5, Level::Q),
+            (7, Level::H),
+            (12, Level::M),
+        ] {
+            for bytes in [&b"a"[..], b"qq", b"\x00\xff\x10", b"notes"] {
+                let code = encode(bytes, version, level)?;
+                let from_bottom = code.side() - 8;
+                assert!(code.is_dark(from_bottom, 8), "version {version}, level {level}");
+                mirrored.push(code.is_dark(8, from_bottom));
+            }
+        }
+        assert!(mirrored.contains(&false), "{mirrored:?}");
+        Ok(())
+    }
 }

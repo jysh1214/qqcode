@@ -235,4 +235,34 @@ mod tests {
         other.extend(checksum(&other).to_be_bytes());
         assert_eq!(Frame::parse(&other), None);
     }
+
+    #[test]
+    fn start_frame_that_ends_before_its_name_is_none() {
+        // what a start screen has before the length of its name, and one byte of that length, each
+        // with a check that is right: too short to be a frame, and not to be read beyond its end
+        for more in 0..2 {
+            let mut frame = MARK.to_vec();
+            frame.push(START);
+            frame.extend([0; HEADER - 3]);
+            frame.extend(vec![0; more]);
+            frame.extend(checksum(&frame).to_be_bytes());
+            assert_eq!(Frame::parse(&frame), None, "{more} bytes after the header");
+        }
+        // with both bytes of the length it is one: a start screen without a name
+        let mut frame = MARK.to_vec();
+        frame.push(START);
+        frame.extend([0; HEADER - 3 + 2]);
+        frame.extend(checksum(&frame).to_be_bytes());
+        let origin = Origin {
+            checksum: 0,
+            length: 0,
+        };
+        assert_eq!(
+            Frame::parse(&frame),
+            Some(Frame::Start {
+                origin,
+                name: String::new()
+            })
+        );
+    }
 }

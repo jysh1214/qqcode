@@ -471,4 +471,59 @@ pub mod tests {
         assert_eq!((screen.runs[0].column, screen.runs[0].row), (1, 1));
         assert_eq!(screen.dot(0, 0), Rgb::WHITE);
     }
+
+    #[test]
+    fn panel_stays_beside_the_code_where_below_would_leave_as_much() {
+        // 64 columns less the panel are 36 dots, and so are 24 rows less the panel: a square of 36 either
+        // way, into which a version 2 of 25 modules fits with its margin
+        let geometry = Geometry::new(64, 24, &settings()).unwrap();
+        assert_eq!((geometry.version, geometry.origin), (2, (5, 11)));
+        assert_eq!(
+            geometry.panel,
+            Some(Cells {
+                left: 37,
+                top: 1,
+                right: 63,
+                bottom: 23
+            })
+        );
+    }
+
+    #[test]
+    fn code_above_the_panel_takes_whole_rows() {
+        // A narrow terminal: 41 columns are a square of 41 dots, which is 20 rows of cells and a half.
+        // The code gets 21 of them, a version 4 of 33 modules in their middle, and the panel begins
+        // below that.
+        let geometry = Geometry::new(41, 60, &settings()).unwrap();
+        assert_eq!((geometry.version, geometry.origin), (4, (4, 4)));
+        assert_eq!(
+            geometry.panel,
+            Some(Cells {
+                left: 2,
+                top: 21,
+                right: 39,
+                bottom: 60
+            })
+        );
+    }
+
+    #[test]
+    fn code_is_drawn_where_it_belongs_when_that_is_further_down_than_across() {
+        // the code is in the middle of the terminal's height and of a square that is less wide than that
+        let settings = settings();
+        let geometry = Geometry::new(64, 24, &settings).unwrap();
+        assert_eq!((geometry.version, geometry.origin), (2, (5, 11)));
+        let code = code::encode(b"qqcode", 2, Level::M).unwrap();
+        let screen = compose(&geometry, &settings, &code, &[], &[]);
+        for row in 0..25 {
+            for column in 0..25 {
+                let colour = if code.is_dark(row, column) {
+                    settings.ink
+                } else {
+                    Rgb::WHITE
+                };
+                assert_eq!(screen.dot(5 + column, 11 + row), colour, "module {row},{column}");
+            }
+        }
+    }
 }

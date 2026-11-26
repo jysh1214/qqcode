@@ -106,4 +106,12 @@ mod tests {
         assert_eq!(fit("ab", 4), "ab");
         assert_eq!(fit("漢字", 3), "漢");
     }
+
+    #[test]
+    fn word_as_wide_as_the_row_is_not_broken() {
+        assert_eq!(wrap("ab cdefgh", 6), ["ab", "cdefgh"]);
+        assert_eq!(wrap("ab cdefgh ij", 6), ["ab", "cdefgh", "ij"]);
+        // one that is wider is, and begins in the row that is begun
+        assert_eq!(wrap("ab cdefghi", 6), ["ab cde", "fghi"]);
+    }
 }

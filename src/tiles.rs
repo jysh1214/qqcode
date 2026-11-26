@@ -523,4 +523,20 @@ mod tests {
             [black, black, white, black]
         );
     }
+
+    #[test]
+    fn tiles_of_another_count_than_the_grid_has_are_no_frame() {
+        let grid = Grid::new(Shape::Square, 4);
+        let payload = (0..grid.capacity()).map(|at| at as u8).collect::<Vec<_>>();
+        let mut tiles = pack(grid, &payload);
+        assert_eq!(
+            unpack(grid, &tiles).map(|unpacked| unpacked.payload),
+            Some(payload)
+        );
+        // read with the wrong guess of what the matrix is: a tile too many, and one too few
+        tiles.push(0);
+        assert_eq!(unpack(grid, &tiles), None);
+        tiles.truncate(tiles.len() - 2);
+        assert_eq!(unpack(grid, &tiles), None);
+    }
 }

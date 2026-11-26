@@ -763,3 +763,15 @@ mod camera {
         Ok(())
     }
 }
+
+#[test]
+fn modules_get_no_smaller_than_a_dot() {
+    let mut app = app(&bytes(200), &["--module", "2", "--margin", "0"]);
+    app.lay_out(80, 24);
+    for _ in 0..3 {
+        press(&mut app, '-');
+    }
+    // the margin may go down to nothing, a module may not
+    assert_eq!((app.settings.module, app.settings.margin), (1, 0));
+    assert!(app.layout.is_some());
+}

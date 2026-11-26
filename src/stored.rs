@@ -1172,4 +1172,138 @@ mod tests {
         fs::remove_file(&path).unwrap();
         fs::remove_file(&sums).unwrap();
     }
+
+    #[test]
+    fn block_is_solved_with_as_many_packets_as_it_has_symbols() {
+        // ten symbols, of which the first is missed
+        let file = bytes(1000, 16);
+        let (path, sums) = names();
+        let encoder = Encoder::new(&file, 9, 100);
+        let mut stored = Stored::create(&path, &sums, 1000, 9, 100).unwrap();
+        for sequence in 1..10 {
+            stored.take(0, sequence, &encoder.packet(0, sequence)).unwrap();
+        }
+        assert!(!stored.is_complete());
+        // one sum that the missing symbol is in makes ten packets, and they are the block
+        let with_first = |sequence: &u32| fountain::terms(9, 0, *sequence, 10)[0] & 1 == 1;
+        let sum = (10..).find(with_first).unwrap();
+        assert!(stored.take(0, sum, &encoder.packet(0, sum)).unwrap());
+        assert!(stored.is_complete());
+        assert_eq!(fs::read(&path).unwrap(), file);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&sums).unwrap();
+    }
+
+    #[test]
+    fn what_has_arrived_is_never_more_than_the_file() {
+        // Ten symbols, the last of them half a packet. Nine arrive, and a sum that the missing one is
+        // not in, which is a packet that counts and no help.
+        let file = bytes(950, 17);
+        let (path, sums) = names();
+        let encoder = Encoder::new(&file, 9, 100);
+        let mut stored = Stored::create(&path, &sums, 950, 9, 100).unwrap();
+        for sequence in 1..10 {
+            stored.take(0, sequence, &encoder.packet(0, sequence)).unwrap();
+        }
+        let without_first = |sequence: &u32| fountain::terms(9, 0, *sequence, 10)[0] & 1 == 0;
+        let sum = (10..).find(without_first).unwrap();
+        assert!(stored.take(0, sum, &encoder.packet(0, sum)).unwrap());
+        // ten packets of 100 bytes are held, of a file of 950
+        assert_eq!(
+            (stored.held(), stored.received(), stored.is_complete()),
+            (10, 950, false)
+        );
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&sums).unwrap();
+    }
+
+    #[test]
+    fn section_that_ends_where_a_block_ends_does_not_wait_for_the_next_block() {
+        // three blocks, and sections as long as the first of them: 43400 bytes
+        let file = bytes(129_950, 18);
+        let (mut stored, encoder, path, sums) = checked(&file, 100, 43_400);
+        assert_eq!(stored.sound(), Some((0, 3)));
+        for sequence in 0..434 {
+            stored.take(0, sequence, &encoder.packet(0, sequence)).unwrap();
+        }
+        // the first section is the first block and nothing of the second
+        assert_eq!(stored.sound(), Some((1, 3)));
+        // so nothing is left to find out about that block, and it takes no sum
+        assert!(!stored.take(0, 434, &encoder.packet(0, 434)).unwrap());
+        assert_eq!(fs::metadata(&sums).unwrap().len(), 0);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&sums).unwrap();
+    }
+
+    #[test]
+    fn symbols_of_a_block_that_is_whole_are_not_taken_again() {
+        // the first of three blocks is whole and waits for the second, which the section from byte
+        // 40000 on lies in as well
+        let file = bytes(129_950, 15);
+        let (mut stored, encoder, path, sums) = checked(&file, 100, 10_000);
+        for sequence in 0..434 {
+            stored.take(0, sequence, &encoder.packet(0, sequence)).unwrap();
+        }
+        // its symbols come round again, as when the page is begun anew: they tell nothing and are no
+        // tests of the block
+        for sequence in 0..40 {
+            assert!(
+                !stored.take(0, sequence, &encoder.packet(0, sequence)).unwrap(),
+                "symbol {sequence}"
+            );
+        }
+        // its sums are tests, as many as a block takes, and nothing else is in the file of sums
+        let taken =
+            (434..470).filter(|sequence| stored.take(0, *sequence, &encoder.packet(0, *sequence)).unwrap());
+        assert_eq!(taken.count(), SPARE);
+        assert_eq!(fs::metadata(&sums).unwrap().len(), (SPARE * 100) as u64);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&sums).unwrap();
+    }
+
+    #[test]
+    fn misread_packet_is_found_by_tests_that_were_there_before_anything_looked_wrong() {
+        // The first block has a part in the section from byte 40000 on, and in that part a symbol that
+        // is misread: the one from byte 41000 on. Nothing shows as long as the second block is missing.
+        let file = bytes(129_950, 19);
+        let (mut stored, encoder, path, sums) = checked(&file, 100, 10_000);
+        for sequence in 0..434 {
+            let packet = encoder.packet(0, sequence);
+            let packet = if sequence == 410 { misread(packet) } else { packet };
+            stored.take(0, sequence, &packet).unwrap();
+        }
+        assert_eq!((stored.sound(), stored.take_notes()), (Some((4, 13)), vec![]));
+        // Meanwhile the block takes the sums that a whole block takes. They are tests of it: those that
+        // the symbol is in fail, the others do not.
+        for sequence in 434..470 {
+            stored.take(0, sequence, &encoder.packet(0, sequence)).unwrap();
+        }
+        assert_eq!(stored.take_notes(), []);
+        // With the second block the section is whole, and wrong. No sum more is needed: the tests that
+        // are there tell which packet it was.
+        for sequence in 0..433 {
+            stored.take(1, sequence, &encoder.packet(1, sequence)).unwrap();
+        }
+        assert_eq!(
+            stored.take_notes(),
+            [
+                Note::Doubted {
+                    section: 4,
+                    from: 40_000
+                },
+                Note::Mended {
+                    section: 4,
+                    from: 40_000
+                }
+            ]
+        );
+        assert_eq!(stored.sound(), Some((8, 13)));
+        for sequence in 0..433 {
+            stored.take(2, sequence, &encoder.packet(2, sequence)).unwrap();
+        }
+        assert!(stored.is_complete());
+        assert_eq!(fs::read(&path).unwrap(), file);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&sums).unwrap();
+    }
 }

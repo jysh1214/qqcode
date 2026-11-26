@@ -472,4 +472,33 @@ mod tests {
             "4 sections of the file have not their checksums, the first of them from byte 2000"
         );
     }
+
+    #[test]
+    fn name_in_a_text_is_made_safe_to_print() {
+        // the list comes from somewhere else and its name ends up on a terminal
+        let text = Checks::of("notes.txt", b"abc").to_string();
+        let text = text.replace("file notes.txt", "file a\u{1b}[2Jb\u{7}c");
+        assert_eq!(Checks::parse(&text).unwrap().name, "a?[2Jb?c");
+    }
+
+    #[test]
+    fn checksum_of_more_than_64_digits_is_none() {
+        let text = Checks::in_sections("f", &bytes(2500), 1000).to_string();
+        let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
+        // two digits more on the SHA-256 of the file
+        let mut longer = lines.clone();
+        longer[4].push_str("00");
+        assert!(
+            Checks::parse(&longer.join("\n"))
+                .unwrap_err()
+                .contains("no SHA-256")
+        );
+        // and on that of a section
+        let mut longer = lines.clone();
+        longer[6] = longer[6].replacen("  ", "00  ", 1);
+        assert_eq!(
+            Checks::parse(&longer.join("\n")).unwrap_err(),
+            "line 7 is to be a SHA-256, two spaces and 0"
+        );
+    }
 }

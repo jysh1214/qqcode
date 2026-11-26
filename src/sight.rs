@@ -675,4 +675,122 @@ mod tests {
         // a frame that happens to have one colour only is read as that
         assert_eq!(classify(&vec![[1.0, 1.0, 0.1]; 50]), vec![1; 50]);
     }
+
+    #[test]
+    fn tiles_are_followed_from_the_corners_to_where_they_are_a_whole_tile_off() -> Result<()> {
+        // A picture that sags: where the corners put it at its left and right edges, and up to 9 pixels
+        // lower towards the middle, which is a whole tile. Only from the corners inwards, an area after
+        // the one before, can the tiles be followed that far; looked for where they ought to be, the
+        // tiles in the middle are those of the row above.
+        let grid = Grid::new(Shape::Wide, 8);
+        let values = values(grid, 6);
+        let straight = picture(grid, &values);
+        let (width, height) = (grid.width() as i32, grid.height() as i32);
+        let mut flat = Mat::new_rows_cols_with_default(height, width, core::CV_8UC3, Scalar::all(0.0))?;
+        flat.data_bytes_mut()?.copy_from_slice(&straight);
+        let mut from_x = Mat::new_rows_cols_with_default(height, width, core::CV_32FC1, Scalar::all(0.0))?;
+        let mut from_y = from_x.clone();
+        let bulge = |at: i32, of: i32, most: f32| most * (std::f32::consts::PI * at as f32 / of as f32).sin();
+        for y in 0..height {
+            for x in 0..width {
+                *from_x.at_2d_mut::<f32>(y, x)? = x as f32 + bulge(y, height, 2.0);
+                *from_y.at_2d_mut::<f32>(y, x)? = y as f32 + bulge(x, width, 9.0);
+            }
+        }
+        let mut bent = Mat::default();
+        imgproc::remap(
+            &flat,
+            &mut bent,
+            &from_x,
+            &from_y,
+            imgproc::INTER_LINEAR,
+            core::BORDER_CONSTANT,
+            Scalar::all(0.0),
+        )?;
+        let read = read_tiles(bent.data_bytes()?, grid);
+        let wrong = read.iter().zip(&values).filter(|(a, b)| a != b).count();
+        assert!(wrong * 50 < values.len(), "{wrong} of {}", values.len());
+        assert!(tiles::unpack(grid, &read).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn tiles_are_read_where_they_are_found_to_the_other_side_as_well() -> Result<()> {
+        // the bulge of a lens the other way round: towards the middle of the picture the tiles are up to
+        // 6 pixels further to the right than the corners put them, and up to 4 further down
+        let grid = Grid::new(Shape::Wide, 8);
+        let values = values(grid, 6);
+        let straight = picture(grid, &values);
+        let (width, height) = (grid.width() as i32, grid.height() as i32);
+        let mut flat = Mat::new_rows_cols_with_default(height, width, core::CV_8UC3, Scalar::all(0.0))?;
+        flat.data_bytes_mut()?.copy_from_slice(&straight);
+        let mut from_x = Mat::new_rows_cols_with_default(height, width, core::CV_32FC1, Scalar::all(0.0))?;
+        let mut from_y = from_x.clone();
+        let bulge = |at: i32, of: i32, most: f32| most * (std::f32::consts::PI * at as f32 / of as f32).sin();
+        for y in 0..height {
+            for x in 0..width {
+                *from_x.at_2d_mut::<f32>(y, x)? = x as f32 - bulge(y, height, 6.0);
+                *from_y.at_2d_mut::<f32>(y, x)? = y as f32 - bulge(x, width, 4.0);
+            }
+        }
+        let mut bent = Mat::default();
+        imgproc::remap(
+            &flat,
+            &mut bent,
+            &from_x,
+            &from_y,
+            imgproc::INTER_LINEAR,
+            core::BORDER_CONSTANT,
+            Scalar::all(0.0),
+        )?;
+        let read = read_tiles(bent.data_bytes()?, grid);
+        let wrong = read.iter().zip(&values).filter(|(a, b)| a != b).count();
+        assert!(wrong * 100 < values.len(), "{wrong} of {}", values.len());
+        assert!(tiles::unpack(grid, &read).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn colours_are_told_apart_where_the_camera_has_them() {
+        // A camera that lets blue through where the page has none: the yellow tiles have between a
+        // third of it and somewhat more than half. For three in ten of them that is nearer to white
+        // as the page has it than to yellow, and nearer to yellow as this camera sees it.
+        let tints = (0..400)
+            .map(|tile| match tile % 4 {
+                0 => [0.95, 1.0, 1.0],
+                1 => [1.0, 1.0, 0.05],
+                2 => [1.0, 0.05, 1.0],
+                _ => [0.36 + 0.002 * (tile / 4) as f32, 1.0, 1.0],
+            })
+            .collect::<Vec<_>>();
+        let colours = classify(&tints);
+        let wrong = (0..400)
+            .filter(|tile| colours[*tile] as usize != tile % 4)
+            .count();
+        assert_eq!(wrong, 0);
+    }
+
+    #[test]
+    fn small_pattern_further_out_than_the_matrix_is_no_corner() {
+        let four = [
+            finder(900.0, 100.0),
+            finder(100.0, 110.0),
+            finder(110.0, 600.0),
+            finder(910.0, 590.0),
+        ];
+        let expected = [four[1], four[0], four[3], four[2]];
+        // something in the corner of the frame that looks like a finder pattern, half the size of those
+        // of the matrix: it lies further out than any of them, and is none of the matrix all the same
+        let mut more = four.to_vec();
+        more.push(Finder {
+            x: 20.0,
+            y: 15.0,
+            size: 21.0,
+        });
+        assert_eq!(corners(&more), Some(expected));
+        // one of nearly their size is taken for a corner, as it has to be: a matrix seen at an angle
+        // has patterns of different sizes
+        more[4].size = 30.0;
+        assert_eq!(corners(&more).map(|corners| corners[0]), Some(more[4]));
+    }
 }

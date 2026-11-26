@@ -982,4 +982,23 @@ mod tests {
             ("1 byte".to_owned(), "2 bytes".to_owned())
         );
     }
+
+    #[test]
+    fn camera_is_asked_for_the_height_that_is_wanted() {
+        // a camera with two sizes of the same width: only the height tells them apart
+        let modes: &[Mode] = &[(640, 480, 30.0), (1280, 720, 30.0), (1280, 1024, 30.0)];
+        let mut camera = Fake::new(&[(MOTION_JPEG, modes)]);
+        let size = request_size(&mut camera, Size::new(1280, 720)).unwrap();
+        assert_eq!(size, Size::new(1280, 720));
+        let size = request_size(&mut camera, Size::new(1280, 1024)).unwrap();
+        assert_eq!(size, Size::new(1280, 1024));
+    }
+
+    #[test]
+    fn motion_jpeg_is_named_as_cameras_name_it() {
+        // The four characters M, J, P, G with the first in the lowest byte, which is 0x47504a4d: the
+        // number that a camera answers with when it is asked for its format, and that it is told.
+        assert_eq!(MOTION_JPEG, 1_196_444_237.0);
+        assert_eq!(MOTION_JPEG as u32 & 0xff, u32::from(b'M'));
+    }
 }

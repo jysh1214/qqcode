@@ -614,4 +614,23 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn file_longer_than_what_is_read_at_a_time_is_identified_whole() {
+        // two megabytes and a half, which are read a megabyte at a time
+        let dir = std::env::temp_dir().join(format!("qqcode-show-long-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("long.bin");
+        let long = bytes(2_500_000);
+        fs::write(&file, &long).unwrap();
+        let (identified, md5) = identify(&file, "long.bin").unwrap();
+        assert_eq!(identified.origin, Origin::of(&long));
+        assert_eq!(identified.sections(), 3);
+        assert!(
+            identified == Checks::of("long.bin", &long),
+            "the checksums of the file"
+        );
+        assert_eq!(md5, qqcode::digest::md5(&long));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

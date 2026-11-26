@@ -781,4 +781,42 @@ mod tests {
         assert_eq!(decoder.received(), 0);
         assert!(!Decoder::new(10, 0, 100).is_complete());
     }
+
+    #[test]
+    fn any_packet_of_a_block_of_one_symbol_is_that_symbol() {
+        // a file that is less than a packet: whatever the page shows of it, the first frame is the file
+        let bytes = file(70, 9);
+        let encoder = Encoder::new(&bytes, 0xfeed_beef, 100);
+        for sequence in 0..200 {
+            let mut decoder = Decoder::new(70, 0xfeed_beef, 100);
+            let taken = decoder.take(0, sequence, &encoder.packet(0, sequence));
+            assert!(taken.new && decoder.is_complete(), "packet {sequence}");
+            assert_eq!(taken.solved.map(|solved| solved.bytes), Some(bytes.clone()));
+        }
+    }
+
+    #[test]
+    fn every_solved_block_counts_towards_what_has_arrived() {
+        // three blocks of 434, 433 and 433 symbols of 100 bytes
+        let bytes = file(129_950, 10);
+        let encoder = Encoder::new(&bytes, 0xfeed_beef, 100);
+        let mut decoder = Decoder::new(129_950, 0xfeed_beef, 100);
+        for sequence in 0..434 {
+            decoder.take(0, sequence, &encoder.packet(0, sequence));
+        }
+        assert_eq!((decoder.held(), decoder.received()), (434, 43_400));
+        for sequence in 0..433 {
+            decoder.take(1, sequence, &encoder.packet(1, sequence));
+        }
+        // two blocks are solved, and both count
+        assert_eq!((decoder.held(), decoder.received()), (867, 86_700));
+        // as do the packets that are held of the third
+        for sequence in 0..33 {
+            decoder.take(2, sequence, &encoder.packet(2, sequence));
+        }
+        assert_eq!(
+            (decoder.held(), decoder.received(), decoder.is_complete()),
+            (900, 90_000, false)
+        );
+    }
 }

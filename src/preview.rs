@@ -432,4 +432,35 @@ mod tests {
         };
         assert!(advice(&unread).starts_with("a code in view that can't be read"));
     }
+
+    #[test]
+    fn outline_of_a_code_has_all_four_sides() -> Result<()> {
+        let frame = Mat::new_rows_cols_with_default(960, 1280, CV_8UC3, Scalar::all(128.0))?;
+        let survey = Survey {
+            codes: vec![code(Kind::Piece, 100.0, 100.0, 400.0)],
+        };
+        // a tenth of the size: the code from (10, 10) to (50, 50)
+        let picture = picture(&frame, &survey, Size::new(128, 96))?;
+        let at = |x: i32, y: i32| -> (u8, u8, u8) {
+            let pixel = picture.at_2d::<Vec3b>(y, x).unwrap();
+            (pixel[0], pixel[1], pixel[2])
+        };
+        // the middle of the top, the right, the bottom and the left
+        assert_eq!([at(30, 10), at(50, 30), at(30, 50), at(10, 30)], [SHOWN; 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn status_describes_the_code_of_the_show_among_several() {
+        // the one that counts is not the first that was found
+        let survey = Survey {
+            codes: vec![
+                code(Kind::Unread, 0.0, 0.0, 100.0),
+                code(Kind::Other, 200.0, 0.0, 100.0),
+                code(Kind::End, 400.0, 0.0, 178.0),
+            ],
+        };
+        let lines = texts(&status(&survey, "", ""));
+        assert_eq!(lines[0], "code: end screen | 89 modules | 2.0 px a module");
+    }
 }
