@@ -46,7 +46,8 @@ struct Progress {
     /// Nothing is left to find out about it: it is whole, and the sections it lies in have their
     /// checksums, if there are checksums. It takes no packet after that.
     settled: bool,
-    /// How many sums there were when a packet that was misread was last looked for in vain
+    /// How many sums there were when a packet that was misread was last looked for in vain, for as long
+    /// as a section that the block lies in is whole and wrong
     searched: Option<usize>,
 }
 
@@ -176,9 +177,10 @@ impl Stored {
             if (sequence as usize) < size || full || !self.keep(index, sequence, bytes)? {
                 return Ok(false);
             }
-            if self.blocks[index].searched.is_some() {
-                self.check(index)?;
-            }
+            // A section of it that is whole and wrong is looked at again with every such sum. That
+            // does not go by whether the block was in doubt when a section was last put right: packets
+            // may be misread in more than one place.
+            self.check(index)?;
             return Ok(true);
         }
         if (sequence as usize) < size {
@@ -405,9 +407,17 @@ impl Stored {
                 }
             }
             if self.sound[section] {
-                suspects
-                    .iter()
-                    .for_each(|block| self.blocks[*block].searched = None);
+                // The blocks whose sections are all right now are in no doubt any more. One that has
+                // another section that is whole and wrong stays in doubt: that was said, and is still
+                // to be put right.
+                for block in &suspects {
+                    let wrong = self
+                        .sections_of(*block)
+                        .any(|section| !self.sound[section] && self.is_whole(checks, section));
+                    if !wrong {
+                        self.blocks[*block].searched = None;
+                    }
+                }
                 self.notes.push(Note::Mended { section, from });
                 return Ok(());
             }
@@ -1296,6 +1306,69 @@ mod tests {
                     from: 40_000
                 }
             ]
+        );
+        assert_eq!(stored.sound(), Some((8, 13)));
+        for sequence in 0..433 {
+            stored.take(2, sequence, &encoder.packet(2, sequence)).unwrap();
+        }
+        assert!(stored.is_complete());
+        assert_eq!(fs::read(&path).unwrap(), file);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&sums).unwrap();
+    }
+
+    #[test]
+    fn misread_packets_in_two_blocks_next_to_each_other_are_both_found() {
+        // The second block has a misread symbol in the section that it shares with the first, from byte
+        // 40000 on, and is whole before the first, which has one in a section of its own, from byte
+        // 10000 on.
+        let file = bytes(129_950, 41);
+        let (mut stored, encoder, path, sums) = checked(&file, 100, 10_000);
+        for sequence in 0..433 {
+            let packet = encoder.packet(1, sequence);
+            let packet = if sequence == 10 { misread(packet) } else { packet };
+            stored.take(1, sequence, &packet).unwrap();
+        }
+        // it waits for the first block, and takes its sums meanwhile
+        for sequence in 433..470 {
+            stored.take(1, sequence, &encoder.packet(1, sequence)).unwrap();
+        }
+        assert_eq!(stored.take_notes(), []);
+        for sequence in 0..434 {
+            let packet = encoder.packet(0, sequence);
+            let packet = if sequence == 100 { misread(packet) } else { packet };
+            stored.take(0, sequence, &packet).unwrap();
+        }
+        // Both sections are whole now, and wrong. The second block has the sums that tell which of its
+        // packets it was; the first has none yet.
+        assert_eq!(
+            stored.take_notes(),
+            [
+                Note::Doubted {
+                    section: 1,
+                    from: 10_000
+                },
+                Note::Mended {
+                    section: 4,
+                    from: 40_000
+                }
+            ]
+        );
+        assert_eq!(stored.sound(), Some((7, 13)));
+        // That one section was put right does not end the doubt about the other. The sums of the first
+        // block are tests of it as they arrive, and tell in their turn; it is not said twice that the
+        // section was wrong.
+        let mut notes = Vec::new();
+        for sequence in 434..470 {
+            stored.take(0, sequence, &encoder.packet(0, sequence)).unwrap();
+            notes.extend(stored.take_notes());
+        }
+        assert_eq!(
+            notes,
+            [Note::Mended {
+                section: 1,
+                from: 10_000
+            }]
         );
         assert_eq!(stored.sound(), Some((8, 13)));
         for sequence in 0..433 {
