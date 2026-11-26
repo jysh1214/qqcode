@@ -1,10 +1,11 @@
 mod preview;
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, IsTerminal, Write};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::thread;
@@ -17,8 +18,11 @@ use opencv::prelude::*;
 use opencv::videoio;
 
 use qqcode::assembly::Assembly;
+use qqcode::digest::{self, Digests};
+use qqcode::packet::Origin;
+use qqcode::protocol::Checksum;
 use qqcode::scan::{Found, Scanner};
-use qqcode::{Outcome, Pipeline, digest};
+use qqcode::{Outcome, Pipeline};
 
 use preview::Preview;
 
@@ -37,7 +41,9 @@ struct Cli {
     #[arg(default_value = "0")]
     input: String,
 
-    /// File to write instead of the standard output
+    /// File to write instead of the standard output. A file that a web page shows is put together on
+    /// disk as it arrives, under the name FILE.part until it is whole, where the standard output gets it
+    /// in one piece at the end: a file that is larger than the memory needs this
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
 
@@ -114,7 +120,13 @@ fn main() -> Result<()> {
     }
     drop(found_by);
 
-    let mut pipeline = Pipeline::new();
+    // A file goes into the memory until it is whole, or with -o to its place as it arrives.
+    let store = cli.output.as_deref().map(Store::new);
+    let mut pipeline = match &store {
+        Some(store) => Pipeline::storing(&store.part, &store.sums),
+        None => Pipeline::new(),
+    };
+    let mut done = false;
     let (mut frames, mut unread) = (0u64, 0u64);
     // the screen of qqcode-show that the last frame with one of its codes showed
     let mut screen = None;
@@ -128,12 +140,23 @@ fn main() -> Result<()> {
         while let Some((frame, codes)) = early.remove(&(frames + 1)) {
             frames += 1;
             let files_before = pipeline.files();
-            let outcome = pipeline.take(codes);
+            let outcome = pipeline.take(codes).with_context(|| format!("frame {frames}"))?;
             if files_before > 0 && pipeline.files() > files_before {
                 log.say(format!(
                     "frame {frames}: the codes of another file, which is the one that is read from here on"
                 ));
                 screen = None;
+            }
+            // once for a file: what it is to be kept in
+            if files_before < pipeline.files()
+                && store.is_none()
+                && let Some(file) = pipeline.file().filter(|file| file.length > 1 << 30)
+            {
+                log.say(format!(
+                    "frame {frames}: the file has {} bytes and is kept in memory until it is whole; with -o FILE \
+                     it is put together on disk as it arrives",
+                    file.length
+                ));
             }
             let screen_before = screen;
             match outcome {
@@ -187,6 +210,7 @@ fn main() -> Result<()> {
                     ));
                 }
                 Outcome::Complete => {
+                    done = true;
                     file = pipeline.take_file();
                     log.say(format!("frame {frames}: the file is whole"));
                 }
@@ -201,7 +225,7 @@ fn main() -> Result<()> {
             };
             frame_at = now;
             // the terminal takes its time over a picture: a dozen of them a second are enough to point by
-            let due = drawn_at.is_none_or(|at| at.elapsed() >= Duration::from_millis(80)) || file.is_some();
+            let due = drawn_at.is_none_or(|at| at.elapsed() >= Duration::from_millis(80)) || done;
             if let Some(preview) = &mut log.preview
                 && due
             {
@@ -221,7 +245,7 @@ fn main() -> Result<()> {
                     break 'frames;
                 }
             }
-            if file.is_some() {
+            if done {
                 break 'frames;
             }
         }
@@ -243,28 +267,37 @@ fn main() -> Result<()> {
             cli.buffer
         );
     }
-    if let Some(file) = file {
-        let to = match &cli.output {
-            Some(path) => {
-                fs::write(path, &file).with_context(|| format!("can't write {}", path.display()))?;
-                path.display().to_string()
+    if done {
+        let origin = pipeline.file().context("a file that is whole has a name")?;
+        let (written, to, digests) = match store {
+            Some(store) => {
+                let to = store.path.display().to_string();
+                let (written, digests) = store.finish(origin, file)?;
+                (written, to, digests)
             }
             None => {
+                let file = file.unwrap_or_default();
                 let mut out = io::stdout().lock();
                 out.write_all(&file)
                     .and_then(|()| out.flush())
                     .context("can't write the file to the standard output")?;
-                "the standard output".to_owned()
+                let digests = (digest::sha256(&file), digest::md5(&file));
+                (file.len() as u64, "the standard output".to_owned(), digests)
             }
         };
-        eprintln!(
-            "{frames} frames read, {} written to {to}",
-            count(file.len(), "byte")
-        );
+        let bytes = if written == 1 {
+            "1 byte".to_owned()
+        } else {
+            format!("{written} bytes")
+        };
+        eprintln!("{frames} frames read, {bytes} written to {to}");
         // to be compared with what qqcode-show prints, or sha256sum and md5sum where the file comes from
-        eprintln!("SHA-256 {}", digest::sha256(&file));
-        eprintln!("MD5 {}", digest::md5(&file));
+        eprintln!("SHA-256 {}", digests.0);
+        eprintln!("MD5 {}", digests.1);
         return Ok(());
+    }
+    if let Some(store) = store {
+        store.discard();
     }
     if taken == 0 {
         bail!("no frame could be read from {}", cli.input);
@@ -283,6 +316,77 @@ fn main() -> Result<()> {
         );
     }
     bail!("no frame showed a code of qqcode-show")
+}
+
+/// Where a file is put together while it arrives: next to the place it is to have, under another name,
+/// and moved there when it is whole and its checksum is right.
+struct Store {
+    path: PathBuf,
+    part: PathBuf,
+    /// The sums of the packets of a web page, which are of no use once the file is whole
+    sums: PathBuf,
+}
+
+impl Store {
+    fn new(path: &Path) -> Self {
+        let beside = |ending: &str| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(ending);
+            PathBuf::from(name)
+        };
+        Self {
+            path: path.to_owned(),
+            part: beside(".part"),
+            sums: beside(".part.sums"),
+        }
+    }
+
+    /// Ends the writing of a file that is whole. `kept` is the file if it was kept in memory, which is
+    /// checked already. A file that was put together on disk is read once more, for its checksum and its
+    /// length, which have to be those of `origin`. Returns how many bytes the file has, and its SHA-256
+    /// and MD5.
+    fn finish(self, origin: Origin, kept: Option<Vec<u8>>) -> Result<(u64, (String, String))> {
+        let part = self.part.display().to_string();
+        let digests = match kept {
+            Some(file) => {
+                fs::write(&self.part, &file).with_context(|| format!("can't write {part}"))?;
+                (digest::sha256(&file), digest::md5(&file))
+            }
+            None => {
+                let file = File::open(&self.part).with_context(|| format!("can't read {part}"))?;
+                let (mut checksum, mut digests, mut length) = (Checksum::new(), Digests::default(), 0u64);
+                let mut piece = vec![0u8; 1 << 20];
+                loop {
+                    let read = file
+                        .read_at(&mut piece, length)
+                        .with_context(|| format!("can't read {part}"))?;
+                    if read == 0 {
+                        break;
+                    }
+                    checksum.update(&piece[..read]);
+                    digests.update(&piece[..read]);
+                    length += read as u64;
+                }
+                // nothing but this stands between a block that was solved wrongly and the file
+                ensure!(
+                    length == origin.length && checksum.finish() == origin.checksum,
+                    "the file that was put together has not the length and the checksum that its frames name: \
+                     it is left as {part}"
+                );
+                digests.finish()
+            }
+        };
+        fs::rename(&self.part, &self.path)
+            .with_context(|| format!("can't move {part} to {}", self.path.display()))?;
+        let _ = fs::remove_file(&self.sums);
+        Ok((origin.length, digests))
+    }
+
+    /// Removes what there is of a file that did not become whole.
+    fn discard(self) {
+        let _ = fs::remove_file(&self.part);
+        let _ = fs::remove_file(&self.sums);
+    }
 }
 
 /// The frames that wait to be searched for codes, in the order they were taken.

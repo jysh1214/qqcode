@@ -79,16 +79,16 @@ qqcode 'frame_%04d.png' > notes.tar.gz                 # or pictures of it
 | Option | Default | |
 | --- | --- | --- |
 | input | `0` | camera index, or a video file, an image or an image sequence |
-| `-o`, `--output` | the standard output | file to write |
+| `-o`, `--output` | the standard output | file to write; a file from a web page is put together on disk as it arrives, see [long files](#long-files) |
 | `--camera-size` | `1920x1080` | frame size to ask a camera for, `WIDTHxHEIGHT`; see below |
 | `--preview` | off | show what the camera sees on the terminal, with the codes that are found; see below |
 | `--threads` | one for each processor but one | how many frames are read at a time |
 | `--buffer` | `256` | how many frames may wait to be read; see below |
 
-The file is written when it is whole and its checksum is right, in one piece, and nothing of it before that:
-a run that is stopped, or whose video ends too early, leaves an empty file behind `>` and none at all behind
-`-o`, and ends with an error. The file goes to the standard output, so `qqcode` refuses to start with that
-being the terminal. What it has to say while it runs goes to the standard error:
+The file is there when it is whole and its checksum is right, and nothing of it before that: a run that is
+stopped, or whose video ends too early, leaves an empty file behind `>` and none at all behind `-o`, and
+ends with an error. The file goes to the standard output, so `qqcode` refuses to start with that being the
+terminal. What it has to say while it runs goes to the standard error:
 
 ```
 camera 0: 1920x1080 frames, 30 a second
@@ -181,7 +181,8 @@ The last line is the page as a browser is told to open it, with the whole path f
 terminals make a link of it, and it can be pasted into the address bar as it is.
 
 The page is one file that loads nothing else and has the file to show inside it, so it is about a third
-larger than that. It can be copied to whatever has the screen. A browser shows the matrix as large as its
+larger than that; the page of a file of more than 64 MB [asks for the file](#long-files) instead. It can be
+copied to whatever has the screen. A browser shows the matrix as large as its
 window allows, on a white ground, and begins on a start screen that says what the file is called and how
 long it is. `qqcode` says when it has that in view, which is the moment to press `enter`: the frames
 follow, `--rate` of them a second, without end. `qqcode` ends by itself when it has the file.
@@ -200,6 +201,8 @@ follow, `--rate` of them a second, without end. `qqcode` ends by itself when it 
 | `--shape` | `wide` | shape of the matrix: `wide` is 16:9, `classic` 4:3, `square` 1:1; best that of the camera's frames |
 | `--scale` | `11` | size of the matrix, 4 to 24: it has 9 rows of tiles for each |
 | `--rate` | `15` | frames a second, 1 to 60 |
+| `--spare` | `10` | frames in a hundred that the first round shows on top of those that make the file, see [long files](#long-files) |
+| `--ask` | for files over 64 MB | write a page that asks for the file when it is opened instead of holding it |
 
 ### The matrix
 
@@ -232,8 +235,61 @@ frame's place in the sequence. Whoever has as many frames of a block as the bloc
 they are, can solve for the packets, give or take a frame or two. A camera that misses a third of the
 frames takes half as long again, and never has to wait for a particular one to come round.
 
-The file has no upper limit in this but memory: the browser holds the page, and `qqcode` what it has
-collected. 1 GB is 99,000 frames at the default size, an hour and fifty minutes at 15 a second.
+### Long files
+
+```sh
+qqcode-show disk.img --html show.html      # 10 GB: the page is 24 kB and asks for disk.img
+qqcode -o disk.img                         # put together on disk as it arrives
+```
+
+Nothing in this keeps a long file in memory, on either side, so a file can be as long as the time there
+is for it. 10 GB are a million frames at the default size, and `qqcode-show` says what that comes to:
+
+| 10 GB at 15 frames a second | The first round | Each round after it |
+| --- | --- | --- |
+| default, `--scale 11` | 20 h 14 min | 1 h 52 min |
+| `--scale 16` | 9 h 30 min | 53 min |
+
+The page of a file of more than 64 MB does not hold the file, which no browser would open. It holds what
+the file is called, how long it is and its checksum, and asks for the file when it is opened: with the
+button, or by dropping the file on the page. It reads the file once to see that it is the one it was
+written for, 3 GB in a quarter of a minute, and after that only what it is about to show. `--ask` makes
+the page of a short file ask as well.
+
+For that the blocks are not all shown by turns. The page takes them in groups of 16, which are 83 MB of
+the file at the default size, shows a group until each of its blocks has had its packets and `--spare`
+sums on top, 10 in a hundred, and goes on to the next group. That is the first round, and a camera that
+misses fewer frames than it has to spare, one in eleven at the default, has the file when it ends. The
+rounds after it are for what the first left unfinished: they show sums alone, never the same one twice,
+as many as the first round had to spare and a tenth of the packets at least, so a round takes about a
+tenth of the time of the first. They go on without end.
+
+`qqcode -o FILE` puts the file together on disk, in `FILE.part`. A packet of the file itself is written
+where it belongs the moment it arrives. A sum goes to a second file, `FILE.part.sums`, and waits there
+until its block has as many packets and sums as it takes; then the packets that are missing are solved
+for and written into their places. Nothing that the camera reads is thrown away, however many rounds a
+file takes, and nothing of it is held in memory but one block while it is solved. The price is disk: the
+file once over, and as much again as the camera misses. When the last block is whole, `qqcode` reads the
+file once more, for its length and its checksum, and only then gives it its name and removes the sums; if
+they are not what the frames said, the file stays `FILE.part` and `qqcode` ends with an error.
+
+Without `-o` the file goes to the standard output in one piece when it is whole, and is kept in memory
+until then, which is as before and fine for a file that fits there; `qqcode` says so when it sees that a
+file of more than 1 GB is coming.
+
+Measured with a file of 1.5 GB at the default size, whose packets were given to the reader as a camera
+would, without the pictures in between; the time is that of the show, the first round being 3 h 2 min:
+
+| Frames lost | The file is whole after | Sums on disk |
+| --- | --- | --- |
+| none | the first round, less its last sums | none |
+| 1 in 20 | the first round | 79 MB |
+| 3 in 20 | 2 rounds more: 3 h 35 min | 228 MB |
+| 3 in 10 | 4 rounds more: 4 h 9 min | 452 MB |
+
+Putting the file together took the reader 13 seconds of all that at most. With frames lost all along, a
+larger `--spare` is the better show: the sums come while their group is on show, and the file is whole
+in one round.
 
 ### What the camera has to manage
 

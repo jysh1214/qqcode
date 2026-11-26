@@ -4,7 +4,9 @@
 //! ([`crate::protocol`], [`crate::assembly`]), or a matrix of tiles on a web page, each frame with a packet
 //! of which any that are enough make the file ([`crate::packet`], [`crate::fountain`]).
 
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 use opencv::core::Mat;
 
 use crate::assembly::Assembly;
@@ -12,6 +14,7 @@ use crate::fountain::Decoder;
 use crate::packet::{Frame, Origin};
 use crate::protocol::{self, Message};
 use crate::scan::{Content, Found, Outline, Scanner};
+use crate::stored::Stored;
 
 /// What became of one frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +109,7 @@ const MAX_LENGTH: u64 = 1 << 40;
 enum Transfer {
     Pieces(Assembly),
     Packets(Decoder),
+    Stored(Stored),
 }
 
 /// What a code of `qqcode-show` says, in either of its two ways.
@@ -131,23 +135,43 @@ pub struct Pipeline {
     /// Whether the file that is on show has been put together
     whole: bool,
     file: Option<Vec<u8>>,
+    /// Where a file that a web page shows is put together on disk, and where its sums are kept
+    /// meanwhile, if it is not to be kept in memory, see [`Pipeline::storing`]
+    store: Option<(PathBuf, PathBuf)>,
+    /// The blocks of a web page that are solved and kept in memory, as far as they reach
+    kept: Vec<u8>,
     survey: Survey,
 }
 
 impl Pipeline {
+    /// A pipeline that keeps the file until it is whole and its checksum is right, and has it in
+    /// [`Pipeline::take_file`] then.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A pipeline for files that are too long to keep in memory. The file that a web page shows is put
+    /// together in the file `part` as its frames arrive, with the help of the file `sums`
+    /// ([`crate::stored`]); both are made anew for every file that comes on show. Once the file is
+    /// whole there the outcome is [`Outcome::Complete`], and it is for whoever named the two to see that
+    /// `part` has the checksum of [`Pipeline::file`] and to do away with `sums`. A file that is shown in
+    /// QR codes is short, and kept in memory as ever.
+    pub fn storing(part: &Path, sums: &Path) -> Self {
+        Self {
+            store: Some((part.to_owned(), sums.to_owned())),
+            ..Self::default()
+        }
     }
 
     /// Reads one frame, in grey or with blue, green and red.
     pub fn process(&mut self, frame: &Mat) -> Result<Outcome> {
         let found = self.scanner.scan(frame)?;
-        Ok(self.take(found))
+        self.take(found)
     }
 
     /// Takes in what a [`Scanner`] found in a frame. The frames may be scanned by several at a time, as
     /// long as what they find is taken in here in the order of the frames.
-    pub fn take(&mut self, found: Vec<Found>) -> Outcome {
+    pub fn take(&mut self, found: Vec<Found>) -> Result<Outcome> {
         let mut codes = Vec::with_capacity(found.len());
         let mut said = None;
         for code in found {
@@ -188,15 +212,15 @@ impl Pipeline {
             said = said.or(says);
         }
         self.survey = Survey { codes };
-        match said {
+        Ok(match said {
             Some(Said::Code(message)) => self.take_message(message),
-            Some(Said::Matrix(frame)) => self.take_frame(frame),
+            Some(Said::Matrix(frame)) => self.take_frame(frame)?,
             None => match self.survey.leading().map(|code| code.kind) {
                 Some(Kind::Unread) => Outcome::Unread,
                 Some(_) => Outcome::Other,
                 None => Outcome::NoCode,
             },
-        }
+        })
     }
 
     /// Makes `origin` the file that is on show. What was collected of another one is of no use for it.
@@ -208,6 +232,7 @@ impl Pipeline {
             self.transfer = None;
             self.name = None;
             self.reached = None;
+            self.kept.clear();
         }
     }
 
@@ -258,54 +283,90 @@ impl Pipeline {
     }
 
     /// Takes in what a frame of the web page says.
-    fn take_frame(&mut self, frame: Frame) -> Outcome {
+    fn take_frame(&mut self, frame: Frame) -> Result<Outcome> {
         let origin = frame.origin();
         if origin.length > MAX_LENGTH {
-            return Outcome::Other;
+            return Ok(Outcome::Other);
         }
         self.turn_to(origin);
         if self.whole {
-            return Outcome::Complete;
+            return Ok(Outcome::Complete);
         }
-        match frame {
+        let (block, sequence, bytes) = match frame {
             Frame::Start { name, .. } => {
                 self.name = Some(name).filter(|name| !name.is_empty());
                 if origin.length > 0 {
-                    return Outcome::Ready;
+                    return Ok(Outcome::Ready);
                 }
                 // a file without a byte has no packets to wait for
                 self.transfer = None;
-                self.finish(Some(Vec::new()))
+                if let Some((part, sums)) = &self.store {
+                    Stored::create(part, sums, 0, origin.checksum, 1)
+                        .with_context(|| format!("can't write {}", part.display()))?;
+                    self.whole = true;
+                    return Ok(Outcome::Complete);
+                }
+                return Ok(self.finish(Some(Vec::new())));
             }
             Frame::Packet {
                 block,
                 sequence,
                 bytes,
                 ..
-            } => {
-                // packets of another size are those of another matrix, with which the page begins anew
-                let fits = matches!(&self.transfer, Some(Transfer::Packets(decoder))
-                    if decoder.plan().symbol == bytes.len());
-                if !fits {
-                    let decoder = Decoder::new(origin.length, origin.checksum, bytes.len());
-                    self.transfer = Some(Transfer::Packets(decoder));
+            } => (block, sequence, bytes),
+        };
+        // packets of another size are those of another matrix, with which the page begins anew
+        let symbol = match &self.transfer {
+            Some(Transfer::Packets(decoder)) => Some(decoder.plan().symbol),
+            Some(Transfer::Stored(stored)) => Some(stored.plan().symbol),
+            _ => None,
+        };
+        if symbol != Some(bytes.len()) {
+            self.kept.clear();
+            self.transfer = Some(match &self.store {
+                Some((part, sums)) => {
+                    let stored = Stored::create(part, sums, origin.length, origin.checksum, bytes.len())
+                        .with_context(|| format!("can't write {}", part.display()))?;
+                    Transfer::Stored(stored)
                 }
-                let Some(Transfer::Packets(decoder)) = &mut self.transfer else {
-                    unreachable!("just set");
-                };
-                let new = decoder.take(block, sequence, &bytes);
-                if !decoder.is_complete() {
-                    return Outcome::Packet { new };
-                }
-                let Some(Transfer::Packets(decoder)) = self.transfer.take() else {
-                    unreachable!("it is complete");
-                };
-                let checked = decoder
-                    .into_bytes()
-                    .filter(|bytes| protocol::checksum(bytes) == origin.checksum);
-                self.finish(checked)
-            }
+                None => Transfer::Packets(Decoder::new(origin.length, origin.checksum, bytes.len())),
+            });
         }
+        let (new, whole) = match &mut self.transfer {
+            Some(Transfer::Stored(stored)) => {
+                let new = stored
+                    .take(block, sequence, &bytes)
+                    .context("can't write the file as it arrives")?;
+                (new, stored.is_complete())
+            }
+            Some(Transfer::Packets(decoder)) => {
+                let taken = decoder.take(block, sequence, &bytes);
+                if let Some(solved) = taken.solved {
+                    let (from, to) = (
+                        solved.offset as usize,
+                        solved.offset as usize + solved.bytes.len(),
+                    );
+                    if self.kept.len() < to {
+                        self.kept.resize(to, 0);
+                    }
+                    self.kept[from..to].copy_from_slice(&solved.bytes);
+                }
+                (taken.new, decoder.is_complete())
+            }
+            _ => unreachable!("just set"),
+        };
+        if !whole {
+            return Ok(Outcome::Packet { new });
+        }
+        self.transfer = None;
+        if self.store.is_some() {
+            // the file is on disk, and whoever said where sees to its checksum
+            self.whole = true;
+            return Ok(Outcome::Complete);
+        }
+        let file = std::mem::take(&mut self.kept);
+        let checked = Some(file).filter(|bytes| protocol::checksum(bytes) == origin.checksum);
+        Ok(self.finish(checked))
     }
 
     /// Ends the collecting of the file: with the file, or with nothing if its checksum is wrong.
@@ -321,7 +382,7 @@ impl Pipeline {
         }
     }
 
-    /// The file, once after [`Outcome::Complete`].
+    /// The file, once after [`Outcome::Complete`]; `None` for a file that was put together on disk.
     pub fn take_file(&mut self) -> Option<Vec<u8>> {
         self.file.take()
     }
@@ -339,6 +400,7 @@ impl Pipeline {
     pub fn packets(&self) -> Option<(usize, usize)> {
         match &self.transfer {
             Some(Transfer::Packets(decoder)) => Some((decoder.held(), decoder.plan().symbols())),
+            Some(Transfer::Stored(stored)) => Some((stored.held(), stored.plan().symbols())),
             _ => None,
         }
     }
@@ -354,6 +416,7 @@ impl Pipeline {
         Some(match &self.transfer {
             Some(Transfer::Pieces(assembly)) => assembly.received() as u64,
             Some(Transfer::Packets(decoder)) => decoder.received(),
+            Some(Transfer::Stored(stored)) => stored.received(),
             None if self.whole => file.length,
             None => 0,
         })

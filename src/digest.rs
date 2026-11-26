@@ -15,6 +15,25 @@ pub fn md5(bytes: &[u8]) -> String {
     hex(&Md5::digest(bytes))
 }
 
+/// The SHA-256 and the MD5 of bytes that come piece by piece.
+#[derive(Default)]
+pub struct Digests {
+    sha256: Sha256,
+    md5: Md5,
+}
+
+impl Digests {
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.sha256.update(bytes);
+        self.md5.update(bytes);
+    }
+
+    /// The two in hexadecimal, the SHA-256 first.
+    pub fn finish(self) -> (String, String) {
+        (hex(&self.sha256.finalize()), hex(&self.md5.finalize()))
+    }
+}
+
 fn hex(digest: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -44,6 +63,16 @@ mod tests {
             sha256(&[b'a'; 1000]),
             "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3"
         );
+    }
+
+    #[test]
+    fn digests_of_pieces_are_those_of_the_whole() {
+        let mut digests = Digests::default();
+        for piece in FOX.chunks(7) {
+            digests.update(piece);
+        }
+        assert_eq!(digests.finish(), (sha256(FOX), md5(FOX)));
+        assert_eq!(Digests::default().finish(), (sha256(b""), md5(b"")));
     }
 
     #[test]

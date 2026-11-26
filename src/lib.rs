@@ -7,6 +7,8 @@
 //! shows that as a matrix of coloured tiles ([`tiles`]) with check bytes for what a camera misreads
 //! ([`rs`]).
 //!
+//! A file that the page shows may be far longer than the memory: [`stored`] puts it together on disk.
+//!
 //! `qqcode` looks for either in the frames of a camera ([`scan`], and [`sight`] for the matrix), and
 //! [`Pipeline`] takes in what is found until the file is whole. Either program ends by printing the
 //! SHA-256 and the MD5 of the file ([`digest`]).
@@ -21,6 +23,7 @@ pub mod reader;
 pub mod rs;
 pub mod scan;
 pub mod sight;
+pub mod stored;
 pub mod tiles;
 
 pub use reader::{Kind, Outcome, Pipeline, Sighting, Survey};

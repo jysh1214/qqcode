@@ -108,6 +108,17 @@ struct Cli {
     /// Web page: frames a second, best half of what the camera takes or less
     #[arg(long, default_value_t = 15, value_parser = within(1..=60), value_name = "FRAMES", requires = "html")]
     rate: usize,
+
+    /// Web page: how many frames in a hundred the first round shows on top of those that make the file,
+    /// for the ones a camera misses. What it leaves unfinished waits for the rounds after it, which are
+    /// short
+    #[arg(long, default_value_t = 10, value_parser = within(0..=400), value_name = "PERCENT", requires = "html")]
+    spare: usize,
+
+    /// Web page: write a page that asks for the file when it is opened instead of holding it, as the
+    /// page of a file of more than 64 MB always does
+    #[arg(long, requires = "html")]
+    ask: bool,
 }
 
 fn within(range: RangeInclusive<usize>) -> RangedU64ValueParser<usize> {
@@ -594,7 +605,12 @@ fn run(app: &mut App, terminal: &mut Terminal) -> Result<Size> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Some(page) = &cli.html {
-        return web::write(&cli.file, page, Grid::new(cli.shape, cli.scale), cli.rate as u32);
+        let format = web::Format {
+            grid: Grid::new(cli.shape, cli.scale),
+            rate: cli.rate as u32,
+            spare: cli.spare,
+        };
+        return web::write(&cli.file, page, format, cli.ask);
     }
     let mut app = App::new(cli)?;
     let mut terminal = Terminal::open()?;

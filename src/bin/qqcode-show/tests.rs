@@ -559,12 +559,17 @@ mod camera {
 
     #[test]
     fn web_page_is_read_from_the_start_screen_to_the_whole_file() -> Result<()> {
-        use crate::web::Show;
+        use crate::web::{Format, Show};
         use qqcode::tiles::{self, Grid, Shape};
 
         let file = bytes(40_000);
         let grid = Grid::new(Shape::Wide, 8);
-        let show = Show::new("notes.bin", &file, grid);
+        let format = Format {
+            grid,
+            rate: 15,
+            spare: 25,
+        };
+        let show = Show::new("notes.bin", &file, format);
         // 5292 bytes a frame, 5265 of them of the file: 8 frames
         assert_eq!((grid.capacity(), show.frames()), (5292, 8));
         let mut pipeline = Pipeline::new();

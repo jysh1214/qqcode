@@ -13,7 +13,7 @@ use opencv::prelude::*;
 use opencv::{imgcodecs, imgproc};
 
 use qqcode::code::{self, Level};
-use qqcode::fountain::Encoder;
+use qqcode::fountain::{Encoder, Schedule};
 use qqcode::packet::{Frame, OVERHEAD, Origin};
 use qqcode::protocol::{FileId, Message};
 use qqcode::tiles::{self, Grid};
@@ -341,7 +341,7 @@ fn page_frame(file: &[u8], frame: Option<u64>) -> Frame {
             name: "notes.bin".to_owned(),
         },
         Some(frame) => {
-            let (block, sequence) = encoder.plan().turn(frame);
+            let (block, sequence) = Schedule::new(encoder.plan().clone(), 25).turn(frame);
             Frame::Packet {
                 origin,
                 block,
@@ -434,6 +434,53 @@ fn reads_a_web_page_from_its_start_screen_to_the_file() -> Result<()> {
 }
 
 #[test]
+fn file_of_a_web_page_is_put_together_on_disk() -> Result<()> {
+    let file = bytes(40_000, 15);
+    let dir = scratch("stored");
+    let (part, sums) = (dir.join("read.part"), dir.join("read.part.sums"));
+    // a pipeline for files that are too long to keep
+    let mut pipeline = Pipeline::storing(&part, &sums);
+    assert_eq!(show_page(&mut pipeline, &file, None)?, Outcome::Ready);
+    // of the eight frames that are the file, the camera misses the third and the sixth
+    for frame in [0, 1, 3, 4, 6, 7] {
+        assert_eq!(
+            show_page(&mut pipeline, &file, Some(frame))?,
+            Outcome::Packet { new: true }
+        );
+    }
+    // what arrived is in its place already, and what did not is a hole
+    let so_far = fs::read(&part)?;
+    assert_eq!(
+        (&so_far[..2 * 5265], &so_far[3 * 5265..5 * 5265]),
+        (&file[..2 * 5265], &file[3 * 5265..5 * 5265])
+    );
+    assert!(so_far[2 * 5265..3 * 5265].iter().all(|byte| *byte == 0));
+    assert_eq!(pipeline.packets(), Some((6, 8)));
+    // sums of the packets follow, and two of them fill the holes, or three
+    let mut outcome = Outcome::NoCode;
+    for frame in 8..12 {
+        outcome = show_page(&mut pipeline, &file, Some(frame))?;
+        if outcome == Outcome::Complete {
+            break;
+        }
+    }
+    assert_eq!(outcome, Outcome::Complete);
+    assert_eq!(fs::read(&part)?, file);
+    // the file is on disk and nowhere else
+    assert_eq!(pipeline.take_file(), None);
+    assert_eq!(pipeline.received(), Some(40_000));
+    assert_eq!(pipeline.file(), Some(Origin::of(&file)));
+    // another file comes on show, one without a byte, which is whole at its start screen: the file on
+    // disk is made anew for it
+    assert_eq!(show_page(&mut pipeline, &[], None)?, Outcome::Complete);
+    assert_eq!(pipeline.file(), Some(Origin::of(&[])));
+    assert_eq!(fs::read(&part)?, b"");
+    assert_eq!(pipeline.take_file(), None);
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[test]
 fn web_page_is_read_from_any_frames_that_are_enough() -> Result<()> {
     let file = bytes(30_000, 12);
     let mut pipeline = Pipeline::new();
@@ -503,6 +550,26 @@ fn program_reads_the_pictures_of_a_web_page() -> Result<()> {
     );
     assert!(said.ends_with(&end), "{said}");
 
+    // To a file that is named it is written as it arrives, under another name until it is whole.
+    let (output, part) = (dir.join("read.bin"), dir.join("read.bin.part"));
+    let run = Command::new(env!("CARGO_BIN_EXE_qqcode"))
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .output()?;
+    let said = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success() && run.stdout.is_empty(), "{said}");
+    assert_eq!(fs::read(&output)?, file);
+    assert!(!part.exists() && !dir.join("read.bin.part.sums").exists());
+    let end = format!(
+        "11 frames read, 50000 bytes written to {}\nSHA-256 {}\nMD5 {}\n",
+        output.display(),
+        digest::sha256(&file),
+        digest::md5(&file)
+    );
+    assert!(said.ends_with(&end), "{said}");
+    fs::remove_file(&output)?;
+
     // without the last frames the file is not whole, and the program says how far it came
     for index in [9, 10, 11, 12] {
         fs::remove_file(dir.join(format!("frame_{index:03}.png")))?;
@@ -514,6 +581,14 @@ fn program_reads_the_pictures_of_a_web_page() -> Result<()> {
         said.contains("the file is not whole: 8 of the 10 packets it takes have arrived"),
         "{said}"
     );
+    // and leaves nothing behind where it was to be written
+    let run = Command::new(env!("CARGO_BIN_EXE_qqcode"))
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .output()?;
+    assert!(!run.status.success());
+    assert!(!output.exists() && !part.exists() && !dir.join("read.bin.part.sums").exists());
     fs::remove_dir_all(&dir)?;
     Ok(())
 }
