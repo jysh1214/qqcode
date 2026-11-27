@@ -44,7 +44,8 @@ struct Cli {
 
     /// File to write instead of the standard output. A file that a web page shows is put together on
     /// disk as it arrives, under the name FILE.part until it is whole, where the standard output gets it
-    /// in one piece at the end: a file that is larger than the memory needs this
+    /// in one piece at the end: a file that is larger than the memory needs this. A run that is stopped
+    /// leaves FILE.part where it is, and the next one with the same FILE goes on with it
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
 
@@ -150,10 +151,11 @@ fn main() -> Result<()> {
     }
     drop(found_by);
 
-    // A file goes into the memory until it is whole, or with -o to its place as it arrives.
+    // A file goes into the memory until it is whole, or with -o to its place as it arrives, where what a
+    // run before this one left of it is gone on with.
     let store = cli.output.as_deref().map(Store::new);
     let mut pipeline = match &store {
-        Some(store) => Pipeline::storing(&store.part, &store.sums),
+        Some(store) => Pipeline::storing(&store.part, &store.sums).resuming(&store.index),
         None => Pipeline::new(),
     };
     if let Some(checks) = checks {
@@ -179,6 +181,14 @@ fn main() -> Result<()> {
             let outcome = pipeline
                 .take(codes)
                 .map_err(|error| anyhow!("frame {frames}: {error:#}"))?;
+            if let (Some(there), Some(store), Some(file)) = (pipeline.take_resumed(), &store, pipeline.file())
+            {
+                log.say(format!(
+                    "frame {frames}: going on with {}, which has {there} of the {}",
+                    store.part.display(),
+                    count(file.length as usize, "byte")
+                ));
+            }
             for note in pipeline.take_notes() {
                 log.say(format!("frame {frames}: {note}"));
             }
@@ -295,6 +305,8 @@ fn main() -> Result<()> {
             }
         }
     }
+    // what there is of a file on disk stays there, with the list of it, for the run that goes on with it
+    pipeline.save()?;
     // nothing more is wanted of the camera or of the frames that wait
     stop.store(true, Ordering::Relaxed);
     buffer.close();
@@ -349,9 +361,6 @@ fn main() -> Result<()> {
         eprintln!("MD5 {}", digests.1);
         return Ok(());
     }
-    if let Some(store) = store {
-        store.discard();
-    }
     if taken == 0 {
         bail!("no frame could be read from {}", cli.input);
     }
@@ -360,7 +369,13 @@ fn main() -> Result<()> {
         bail!("the file is not whole: {}", lacking(assembly));
     }
     if let Some((held, needed)) = pipeline.packets() {
-        bail!("the file is not whole: {held} of the {needed} packets it takes have arrived");
+        let kept = store.map_or(String::new(), |store| {
+            format!(
+                "; they are kept in {}, and the same command goes on with them",
+                store.part.display()
+            )
+        });
+        bail!("the file is not whole: {held} of the {needed} packets it takes have arrived{kept}");
     }
     if unread > 0 {
         bail!(
@@ -372,12 +387,15 @@ fn main() -> Result<()> {
 }
 
 /// Where a file is put together while it arrives: next to the place it is to have, under another name,
-/// and moved there when it is whole and its checksum is right.
+/// and moved there when it is whole and its checksum is right. Until then it stays under that name,
+/// whatever ends the run, and the next run goes on with it.
 struct Store {
     path: PathBuf,
     part: PathBuf,
     /// The sums of the packets of a web page, which are of no use once the file is whole
     sums: PathBuf,
+    /// Which packets of a web page are in the two, which is what another run goes on by
+    index: PathBuf,
 }
 
 impl Store {
@@ -391,6 +409,7 @@ impl Store {
             path: path.to_owned(),
             part: beside(".part"),
             sums: beside(".part.sums"),
+            index: beside(".part.index"),
         }
     }
 
@@ -425,15 +444,22 @@ impl Store {
                     digests.update(&piece[..read]);
                     length += read as u64;
                 }
+                let digests = digests.finish();
                 // nothing but this stands between a block that was solved wrongly and the file
+                let named = length == origin.length && checksum.finish() == origin.checksum;
+                let hashed = sha256.is_none_or(|sha256| sha256 == digests.0);
+                if !(named && hashed) {
+                    // A file that is whole and wrong is not gone on with, as nothing says which of its
+                    // packets to read again: without its index the next run begins it anew.
+                    let _ = fs::remove_file(&self.index);
+                }
                 ensure!(
-                    length == origin.length && checksum.finish() == origin.checksum,
+                    named,
                     "the file that was put together has not the length and the checksum that its frames name: \
                      it is left as {part}"
                 );
-                let digests = digests.finish();
                 ensure!(
-                    sha256.is_none_or(|sha256| sha256 == digests.0),
+                    hashed,
                     "the file that was put together has not the SHA-256 that its checksums name: it is left \
                      as {part}"
                 );
@@ -443,13 +469,8 @@ impl Store {
         fs::rename(&self.part, &self.path)
             .with_context(|| format!("can't move {part} to {}", self.path.display()))?;
         let _ = fs::remove_file(&self.sums);
+        let _ = fs::remove_file(&self.index);
         Ok((origin.length, digests))
-    }
-
-    /// Removes what there is of a file that did not become whole.
-    fn discard(self) {
-        let _ = fs::remove_file(&self.part);
-        let _ = fs::remove_file(&self.sums);
     }
 }
 

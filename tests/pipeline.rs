@@ -549,6 +549,192 @@ fn file_on_disk_is_held_against_its_checksums_and_a_misread_packet_is_left_out()
 }
 
 #[test]
+fn file_on_disk_is_gone_on_with_by_the_next_run() -> Result<()> {
+    // eight packets of 5265 bytes, in eight sections of 5000
+    let file = bytes(40_000, 41);
+    let dir = scratch("resumed");
+    let (part, sums, index) = (
+        dir.join("read.part"),
+        dir.join("read.part.sums"),
+        dir.join("read.part.index"),
+    );
+    let checks = Checks::in_sections("notes.bin", &file, 5000);
+    let run = || {
+        Pipeline::storing(&part, &sums)
+            .resuming(&index)
+            .checked(checks.clone())
+    };
+    let packet = |frame: u64| found(page_frame(&file, Some(frame)));
+    let mut pipeline = run();
+    assert_eq!(pipeline.take(found(page_frame(&file, None)))?, Outcome::Ready);
+    // three packets of the file and a sum
+    for frame in [0, 1, 3, 8] {
+        assert_eq!(pipeline.take(packet(frame))?, Outcome::Packet { new: true });
+    }
+    assert_eq!(pipeline.take_resumed(), None);
+    assert_eq!(
+        (pipeline.packets(), pipeline.received()),
+        (Some((4, 8)), Some(21_060))
+    );
+    // the run is stopped, and what it has stays where it is
+    assert!(!index.exists());
+    pipeline.save()?;
+    assert!(index.exists());
+    drop(pipeline);
+    let left = fs::read(&part)?;
+
+    // The next run comes to a page that has gone on: it has no start screen to see, and nothing but
+    // the packet in front of it to tell it what the file is.
+    let mut pipeline = run();
+    assert_eq!((pipeline.packets(), pipeline.take_resumed()), (None, None));
+    assert_eq!(pipeline.take(packet(4))?, Outcome::Packet { new: true });
+    assert_eq!(pipeline.take_resumed(), Some(21_060));
+    assert_eq!(pipeline.take_resumed(), None);
+    assert_eq!(
+        (pipeline.packets(), pipeline.sound()),
+        (Some((5, 8)), Some((0, 8)))
+    );
+    // nothing was made anew, and what the first run read is not read again
+    assert_eq!(fs::read(&part)?[..4 * 5265], left[..]);
+    for frame in [0, 3, 8] {
+        assert_eq!(pipeline.take(packet(frame))?, Outcome::Packet { new: false });
+    }
+    // stopped once more, with nothing new, and gone on with by a third run to the end
+    pipeline.save()?;
+    drop(pipeline);
+    let mut pipeline = run();
+    let mut outcome = Outcome::NoCode;
+    for frame in 5..24 {
+        outcome = pipeline.take(packet(frame))?;
+        if outcome == Outcome::Complete {
+            break;
+        }
+    }
+    assert_eq!(outcome, Outcome::Complete);
+    assert_eq!(pipeline.take_resumed(), Some(5 * 5265));
+    assert_eq!(pipeline.take_notes(), []);
+    assert_eq!(fs::read(&part)?, file);
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[test]
+fn what_a_run_left_of_something_else_is_not_thrown_away() -> Result<()> {
+    let file = bytes(40_000, 42);
+    let origin = Origin::of(&file);
+    let dir = scratch("left");
+    let (part, sums, index) = (
+        dir.join("read.part"),
+        dir.join("read.part.sums"),
+        dir.join("read.part.index"),
+    );
+    let run = || Pipeline::storing(&part, &sums).resuming(&index);
+    let packet = |frame: u64| found(page_frame(&file, Some(frame)));
+    // the page with a larger matrix: packets of 10077 bytes, of which the file is four
+    let encoder = Encoder::new(&file, origin.checksum, 10_077);
+    let larger = |sequence: u32| {
+        found(Frame::Packet {
+            origin,
+            block: 0,
+            sequence,
+            bytes: encoder.packet(0, sequence),
+        })
+    };
+    let mut pipeline = run();
+    for frame in 0..5 {
+        pipeline.take(packet(frame))?;
+    }
+    pipeline.save()?;
+    drop(pipeline);
+    let left = (fs::read(&part)?, fs::read(&index)?);
+
+    // The same file in packets of another size: what there is of it is of no use for them, and took
+    // too long to read for the page to do away with it.
+    let mut pipeline = run();
+    let error = pipeline.take(larger(0)).unwrap_err().to_string();
+    let told = format!(
+        "{} has what arrived of this file in packets of 5265 bytes, and the page shows packets of 10077 bytes \
+         now. The file is gone on with by the matrix that it was begun with; for another one, {0} is to be \
+         removed first, and the file begins anew",
+        part.display()
+    );
+    assert_eq!(error, told);
+    // another file
+    let other = bytes(30_000, 43);
+    let mut pipeline = run();
+    let error = pipeline
+        .take(found(page_frame(&other, Some(0))))
+        .unwrap_err()
+        .to_string();
+    let told = format!(
+        "{} has what arrived of another file, one of 40000 bytes with the CRC-32 {:08x}, and is not thrown away \
+         for the file on show: it is to be moved or removed first",
+        part.display(),
+        origin.checksum
+    );
+    assert_eq!(error, told);
+    // and one without a byte, which would be whole at its start screen
+    let mut pipeline = run();
+    let error = pipeline.take(found(page_frame(&[], None))).unwrap_err();
+    assert!(
+        error.to_string().contains("has what arrived of another file"),
+        "{error}"
+    );
+    assert_eq!((fs::read(&part)?, fs::read(&index)?), left);
+    // the page as it was is gone on with after all that
+    let mut pipeline = run();
+    assert_eq!(pipeline.take(packet(5))?, Outcome::Packet { new: true });
+    assert_eq!(pipeline.packets(), Some((6, 8)));
+
+    // What this run has itself is another matter: a page that goes on with another matrix while it is
+    // read begins the file anew, as ever, and the index that was there is not that of the new file.
+    assert_eq!(pipeline.take(larger(0))?, Outcome::Packet { new: true });
+    assert_eq!(pipeline.packets(), Some((1, 4)));
+    assert!(!index.exists());
+    pipeline.save()?;
+    drop(pipeline);
+    let mut pipeline = run();
+    assert_eq!(pipeline.take(larger(1))?, Outcome::Packet { new: true });
+    assert_eq!(
+        (pipeline.take_resumed(), pipeline.packets()),
+        (Some(10_077), Some((2, 4)))
+    );
+    // so does another file that comes on show
+    assert_eq!(
+        pipeline.take(found(page_frame(&other, Some(0))))?,
+        Outcome::Packet { new: true }
+    );
+    assert_eq!(pipeline.file(), Some(Origin::of(&other)));
+    assert!(!index.exists());
+    drop(pipeline);
+
+    // An index whose file is gone is of nothing, and one that is damaged is said to be.
+    fs::write(&index, &left.1)?;
+    fs::remove_file(&part)?;
+    let mut pipeline = run();
+    assert_eq!(pipeline.take(larger(0))?, Outcome::Packet { new: true });
+    assert_eq!(
+        (pipeline.take_resumed(), pipeline.packets()),
+        (None, Some((1, 4)))
+    );
+    pipeline.save()?;
+    drop(pipeline);
+    let mut damaged = fs::read(&index)?;
+    damaged[20] ^= 1;
+    fs::write(&index, &damaged)?;
+    let mut pipeline = run();
+    let error = format!("{:#}", pipeline.take(larger(1)).unwrap_err());
+    let told = format!(
+        "can't read {}: this is no index: its checksum is wrong",
+        index.display()
+    );
+    assert_eq!(error, told);
+    assert_eq!(fs::read(&index)?, damaged);
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[test]
 fn no_other_file_is_taken_than_the_one_that_the_checksums_are_of() -> Result<()> {
     let (file, other) = (bytes(20_000, 17), bytes(20_000, 18));
     let mut pipeline = Pipeline::new().checked(Checks::of("notes.bin", &file));
@@ -788,14 +974,70 @@ fn program_reads_the_pictures_of_a_web_page() -> Result<()> {
         said.contains("the file is not whole: 8 of the 10 packets it takes have arrived"),
         "{said}"
     );
-    // and leaves nothing behind where it was to be written
-    let run = Command::new(env!("CARGO_BIN_EXE_qqcode"))
-        .arg(&input)
-        .arg("-o")
-        .arg(&output)
-        .output()?;
-    assert!(!run.status.success());
-    assert!(!output.exists() && !part.exists() && !dir.join("read.bin.part.sums").exists());
+    // Where it was to be written there is nothing then. What arrived is kept next to it, with the list
+    // of it, and the program says so.
+    let to = |input: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_qqcode"))
+            .arg(input)
+            .arg("-o")
+            .arg(&output)
+            .output()
+    };
+    let run = to(&input)?;
+    let said = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success() && !output.exists(), "{said}");
+    let end = format!(
+        "9 frames read, nothing written\nError: the file is not whole: 8 of the 10 packets it takes have arrived; \
+         they are kept in {}, and the same command goes on with them\n",
+        part.display()
+    );
+    assert!(said.ends_with(&end), "{said}");
+    let (sums, index) = (dir.join("read.bin.part.sums"), dir.join("read.bin.part.index"));
+    assert!(part.exists() && sums.exists() && index.exists());
+    assert_eq!(fs::read(&part)?[..8 * 5265], file[..8 * 5265]);
+    // A run that sees nothing of the show leaves all of that as it is.
+    let nothing = dir.join("nothing");
+    fs::create_dir_all(&nothing)?;
+    let blank = Mat::new_size_with_default(Size::new(640, 480), CV_8UC3, Scalar::all(240.0))?;
+    assert!(imgcodecs::imwrite_def(
+        nothing.join("frame_000.png").to_str().unwrap(),
+        &blank
+    )?);
+    let kept = fs::read(&index)?;
+    let run = to(&nothing.join("frame_%03d.png"))?;
+    let said = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success(), "{said}");
+    assert!(
+        said.ends_with("no frame showed a code of qqcode-show\n"),
+        "{said}"
+    );
+    assert!(part.exists() && sums.exists() && fs::read(&index)? == kept);
+    // The same command goes on with it, on a page that has gone on meanwhile: of the four frames that
+    // it sees, the first two are the packets that were missing.
+    let more = dir.join("more");
+    fs::create_dir_all(&more)?;
+    for (index, frame) in (8..12).enumerate() {
+        let path = more.join(format!("frame_{index:03}.png"));
+        let seen = page_seen(&page_frame(&file, Some(frame)))?;
+        assert!(imgcodecs::imwrite_def(path.to_str().unwrap(), &seen)?);
+    }
+    let run = to(&more.join("frame_%03d.png"))?;
+    let said = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success() && run.stdout.is_empty(), "{said}");
+    let begin = format!(
+        "frame 1: going on with {}, which has 42120 of the 50000 bytes\n",
+        part.display()
+    );
+    assert!(said.starts_with(&begin), "{said}");
+    let end = format!(
+        "frame 2: the file is whole\n2 frames read, 50000 bytes written to {}\nSHA-256 {}\nMD5 {}\n",
+        output.display(),
+        digest::sha256(&file),
+        digest::md5(&file)
+    );
+    assert!(said.ends_with(&end), "{said}");
+    assert_eq!(fs::read(&output)?, file);
+    assert!(!part.exists() && !sums.exists() && !index.exists());
     fs::remove_dir_all(&dir)?;
     Ok(())
 }
@@ -1428,6 +1670,45 @@ fn program_does_not_give_a_file_with_a_misread_packet_its_name() -> Result<()> {
     assert!(!output.exists());
     let left = fs::read(&part)?;
     assert!(left.len() == file.len() && left != file);
+
+    // The same of a file that took two runs. Nothing says which of its packets to read again, so the
+    // run after those two is not to go on with it: the list of what arrived is gone, and the file
+    // begins anew.
+    fs::remove_file(&part)?;
+    let index = dir.join("read.bin.part.index");
+    let first = dir.join("first");
+    fs::create_dir_all(&first)?;
+    for frame in 0..6 {
+        let name = format!("frame_{frame:03}.png");
+        fs::copy(dir.join(&name), first.join(&name))?;
+    }
+    let run = |input: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_qqcode"))
+            .arg(input.join("frame_%03d.png"))
+            .arg("-o")
+            .arg(&output)
+            .output()
+    };
+    let stopped = run(&first)?;
+    let said = String::from_utf8_lossy(&stopped.stderr);
+    assert!(
+        said.contains("5 of the 10 packets it takes have arrived; they are kept in"),
+        "{said}"
+    );
+    assert!(index.exists());
+    let whole = run(&dir)?;
+    let said = String::from_utf8_lossy(&whole.stderr);
+    assert!(
+        said.contains(", which has 26325 of the 50000 bytes\n") && said.contains("it is left as"),
+        "{said}"
+    );
+    assert!(!whole.status.success() && !output.exists() && part.exists() && !index.exists());
+    let again = run(&dir)?;
+    let said = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        !said.contains("going on with") && said.contains("it is left as"),
+        "{said}"
+    );
     fs::remove_dir_all(&dir)?;
     Ok(())
 }

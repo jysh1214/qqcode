@@ -79,7 +79,7 @@ qqcode 'frame_%04d.png' > notes.tar.gz                 # or pictures of it
 | Option | Default | |
 | --- | --- | --- |
 | input | `0` | camera index, or a video file, an image or an image sequence |
-| `-o`, `--output` | the standard output | file to write; a file from a web page is put together on disk as it arrives, see [long files](#long-files) |
+| `-o`, `--output` | the standard output | file to write; a file from a web page is put together on disk as it arrives, see [long files](#long-files), and a run that is stopped is [gone on with](#going-on-with-a-file) by the next |
 | `--check` | | the checksums of the file that is to arrive, which it is held against; see [checksums ahead of the file](#checksums-ahead-of-the-file) |
 | `--camera-size` | `1920x1080` | frame size to ask a camera for, `WIDTHxHEIGHT`; see below |
 | `--preview` | off | show what the camera sees on the terminal, with the codes that are found; see below |
@@ -88,8 +88,10 @@ qqcode 'frame_%04d.png' > notes.tar.gz                 # or pictures of it
 
 The file is there when it is whole and its checksum is right, and nothing of it before that: a run that is
 stopped, or whose video ends too early, leaves an empty file behind `>` and none at all behind `-o`, and
-ends with an error. The file goes to the standard output, so `qqcode` refuses to start with that being the
-terminal. What it has to say while it runs goes to the standard error:
+ends with an error. What a web page had shown of the file by then is kept next to where `-o` puts it, and
+the same command [goes on with it](#going-on-with-a-file). The file goes to the standard output, so
+`qqcode` refuses to start with that being the terminal. What it has to say while it runs goes to the
+standard error:
 
 ```
 camera 0: 1920x1080 frames, 30 a second
@@ -284,7 +286,8 @@ for and written into their places. Nothing that the camera reads is thrown away,
 file takes, and nothing of it is held in memory but one block while it is solved. The price is disk: the
 file once over, and as much again as the camera misses. When the last block is whole, `qqcode` reads the
 file once more, for its length and its checksum, and only then gives it its name and removes the sums; if
-they are not what the frames said, the file stays `FILE.part` and `qqcode` ends with an error.
+they are not what the frames said, the file stays `FILE.part` and `qqcode` ends with an error. A run that
+ends before the file is whole leaves both where they are, see [going on with a file](#going-on-with-a-file).
 
 Without `-o` the file goes to the standard output in one piece when it is whole, and is kept in memory
 until then, which is as before and fine for a file that fits there; `qqcode` says so when it sees that a
@@ -303,6 +306,52 @@ would, without the pictures in between; the time is that of the show, the first 
 Putting the file together took the reader 13 seconds of all that at most. With frames lost all along, a
 larger `--spare` is the better show: the sums come while their group is on show, and the file is whole
 in one round.
+
+### Going on with a file
+
+A show of hours gets stopped: by `q` in the preview, by Ctrl-C, by a camera that is pulled out. With
+`-o FILE` nothing of what had arrived is lost by that. `FILE.part` and `FILE.part.sums` stay where they
+are, and a third file next to them, `FILE.part.index`, says which packets are in the two. The next run
+with the same `-o FILE` finds the three, goes on from there, and says so:
+
+```
+frame 2: going on with notes.tar.gz.part, which has 96688815 of the 203541436 bytes
+```
+
+`qqcode` writes the index when it stops, and every five seconds while packets arrive, each time after
+the two files that it is of are on disk. So a run that is cut off with no time to write anything, by
+Ctrl-C without `--preview` or by the power, has read its last five seconds at most for nothing, and the
+index that it leaves never names a packet that is not there. The index of a file of 200 MB has 13 kB.
+
+The run that goes on needs no start screen, as every frame says what file it is of, and takes the page
+as it finds it:
+
+- A page that was paused with `space` goes on where it was, and nothing is missing.
+- A page that went on meanwhile has shown frames to nobody. They are made up for as frames that a camera
+  misses are: by the sums that the first round has to spare, and after it by the short rounds, which
+  bring a tenth of a block each. That is soon done for a minute that went by and slow for an hour, so
+  the page is better paused.
+- A page that begins again, with `g` or opened anew, shows the file from its first packet. `qqcode` has
+  no use for the packets that it has, and the page can't be told to leave them out: the others come
+  when their turn comes, which is no sooner than without what was kept.
+
+The file has to be shown as it was begun: the same file, with the same matrix. `--rate` and `--spare`
+may be other ones, since they change which frames come when and not what is in them. `--scale` and
+`--shape` may not: a frame of another size holds a packet of another size, and what arrived is no part
+of those. `qqcode` does not throw away what took hours to read for a page that shows something else, and
+ends with an error at the first frame of it:
+
+```
+Error: frame 2: notes.tar.gz.part has what arrived of this file in packets of 10077 bytes, and the page shows packets of 5265 bytes now. The file is gone on with by the matrix that it was begun with; for another one, notes.tar.gz.part is to be removed first, and the file begins anew
+```
+
+`rm notes.tar.gz.part*` is that new beginning.
+
+With `--check`, a run that goes on holds every section that was whole against its checksum again before
+it takes a packet in, which is a fraction of a second for 200 MB: what it builds on is what the list
+says, whatever the index says. Without the list, a file that is whole and has not the checksum that its
+frames name is not gone on with. Nothing says which of its packets to read again, so `qqcode` removes
+its index, and the next run begins the file anew.
 
 ### Checksums ahead of the file
 

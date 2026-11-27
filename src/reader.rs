@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use opencv::core::Mat;
 
 use crate::assembly::Assembly;
@@ -141,6 +141,13 @@ pub struct Pipeline {
     /// Where a file that a web page shows is put together on disk, and where its sums are kept
     /// meanwhile, if it is not to be kept in memory, see [`Pipeline::storing`]
     store: Option<(PathBuf, PathBuf)>,
+    /// Where it is kept which packets are in the two, see [`Pipeline::resuming`]
+    index: Option<PathBuf>,
+    /// Whether a file has been begun on disk. What is there after that is what this run put there, and
+    /// not what another one left.
+    begun: bool,
+    /// How many bytes there were of a file that is gone on with, until [`Pipeline::take_resumed`] asks
+    resumed: Option<u64>,
     /// The blocks of a web page that are solved and kept in memory, as far as they reach
     kept: Vec<u8>,
     /// The checksums of the one file that is taken, see [`Pipeline::checked`]
@@ -158,7 +165,8 @@ impl Pipeline {
 
     /// A pipeline for files that are too long to keep in memory. The file that a web page shows is put
     /// together in the file `part` as its frames arrive, with the help of the file `sums`
-    /// ([`crate::stored`]); both are made anew for every file that comes on show. Once the file is
+    /// ([`crate::stored`]); both are made anew for every file that comes on show, unless what another
+    /// run left of it is gone on with ([`Pipeline::resuming`]). Once the file is
     /// whole there the outcome is [`Outcome::Complete`], and it is for whoever named the two to see that
     /// `part` has the checksum of [`Pipeline::file`] and to do away with `sums`. A file that is shown in
     /// QR codes is short, and kept in memory as ever.
@@ -167,6 +175,23 @@ impl Pipeline {
             store: Some((part.to_owned(), sums.to_owned())),
             ..Self::default()
         }
+    }
+
+    /// Goes on with a file that a run before this one did not finish, and leaves what this run does not
+    /// finish for the next. This is for a pipeline that puts the file together on disk
+    /// ([`Pipeline::storing`]): `index` is a third file, in which it is kept which packets are in the
+    /// other two ([`crate::stored`]). It is written every few seconds while packets arrive, and by
+    /// [`Pipeline::save`].
+    ///
+    /// If the three are there when the first packet of this run is read, and they are of the file on
+    /// show in packets of the size on show, nothing is made anew: what had arrived counts, and
+    /// [`Pipeline::take_resumed`] says how much that is. If they are of another file, or of packets of
+    /// another size, that packet is an error, and they stay as they are: what took hours to read is not
+    /// thrown away for a page that shows something else. What this run began itself is made anew for
+    /// another file or another matrix, as without an index.
+    pub fn resuming(mut self, index: &Path) -> Self {
+        self.index = Some(index.to_owned());
+        self
     }
 
     /// Takes no other file than the one that `checks` are of, which makes a frame of another file an
@@ -337,9 +362,8 @@ impl Pipeline {
                 }
                 // a file without a byte has no packets to wait for
                 self.transfer = None;
-                if let Some((part, sums)) = &self.store {
-                    Stored::create(part, sums, 0, origin.checksum, 1)
-                        .with_context(|| format!("can't write {}", part.display()))?;
+                if self.store.is_some() {
+                    self.begin(origin, 1)?;
                     self.whole = true;
                     return Ok(Outcome::Complete);
                 }
@@ -360,16 +384,10 @@ impl Pipeline {
         };
         if symbol != Some(bytes.len()) {
             self.kept.clear();
-            self.transfer = Some(match &self.store {
-                Some((part, sums)) => {
-                    let stored = Stored::create(part, sums, origin.length, origin.checksum, bytes.len())
-                        .with_context(|| format!("can't write {}", part.display()))?;
-                    Transfer::Stored(match &self.checks {
-                        Some(checks) => stored.checked(checks.clone()),
-                        None => stored,
-                    })
-                }
-                None => Transfer::Packets(Decoder::new(origin.length, origin.checksum, bytes.len())),
+            self.transfer = Some(if self.store.is_some() {
+                Transfer::Stored(self.begin(origin, bytes.len())?)
+            } else {
+                Transfer::Packets(Decoder::new(origin.length, origin.checksum, bytes.len()))
             });
         }
         let (new, whole) = match &mut self.transfer {
@@ -408,6 +426,72 @@ impl Pipeline {
         let file = std::mem::take(&mut self.kept);
         let checked = Some(file).filter(|bytes| protocol::checksum(bytes) == origin.checksum);
         Ok(self.finish(checked))
+    }
+
+    /// Begins the file `origin` on disk, in packets of `symbol` bytes: anew, or with what a run before
+    /// this one left of it, see [`Pipeline::resuming`].
+    fn begin(&mut self, origin: Origin, symbol: usize) -> Result<Stored> {
+        let (part, sums) = self.store.clone().expect("a place for the file");
+        let name = part.display();
+        let left = match &self.index {
+            // an index without the file it is of is of nothing
+            Some(index) if !self.begun && part.exists() => {
+                Stored::kept(index).with_context(|| format!("can't read {}", index.display()))?
+            }
+            _ => None,
+        };
+        self.begun = true;
+        if let (Some(left), Some(index)) = (left, &self.index) {
+            if (left.length, left.checksum) != (origin.length, origin.checksum) {
+                bail!(
+                    "{name} has what arrived of another file, one of {} bytes with the CRC-32 {:08x}, and is not \
+                     thrown away for the file on show: it is to be moved or removed first",
+                    left.length,
+                    left.checksum
+                );
+            }
+            if left.symbol != symbol {
+                bail!(
+                    "{name} has what arrived of this file in packets of {} bytes, and the page shows packets of \
+                     {symbol} bytes now. The file is gone on with by the matrix that it was begun with; for \
+                     another one, {name} is to be removed first, and the file begins anew",
+                    left.symbol
+                );
+            }
+            let stored = Stored::resume(&part, &sums, index, self.checks.clone())
+                .with_context(|| format!("can't go on with {name} by {}", index.display()))?;
+            self.resumed = Some(stored.received());
+            return Ok(stored);
+        }
+        let mut stored = Stored::create(&part, &sums, origin.length, origin.checksum, symbol)
+            .with_context(|| format!("can't write {name}"))?;
+        if let Some(index) = &self.index {
+            stored = stored
+                .indexed(index)
+                .with_context(|| format!("can't remove {}", index.display()))?;
+        }
+        Ok(match &self.checks {
+            Some(checks) => stored.checked(checks.clone()),
+            None => stored,
+        })
+    }
+
+    /// Writes down what has arrived of a file that is put together on disk, for a run that goes on with
+    /// it ([`Pipeline::resuming`]). Nothing is done without an index, or for a file that is kept in
+    /// memory.
+    pub fn save(&mut self) -> Result<()> {
+        if let (Some(Transfer::Stored(stored)), Some(index)) = (&mut self.transfer, &self.index) {
+            stored
+                .save()
+                .with_context(|| format!("can't write {}", index.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Once after a file was gone on with rather than begun: how many bytes of it had arrived in the
+    /// runs before this one.
+    pub fn take_resumed(&mut self) -> Option<u64> {
+        self.resumed.take()
     }
 
     /// Ends the collecting of the file: with the file, or with nothing if its checksum is wrong or those

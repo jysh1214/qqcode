@@ -17,20 +17,96 @@
 //! most, because every sum more is a test of the block as it was solved: the tests that fail all miss by
 //! the same bytes, and which of them fail is the mark of one packet. That packet is left out, the block
 //! is made of the others, and the sections are held against their checksums again.
+//!
+//! A third file, the index, says which packets there are in the two: which symbols of each block arrived,
+//! and which sums and where they lie. It is written again every few seconds, and a run that finds it goes
+//! on with the file where the run before it stopped ([`Stored::resume`]). Only what was whole is looked
+//! at again then, section by section against the checksums.
 
-use std::fs::File;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::checks::{Checks, Note};
 use crate::fountain::{self, Block, Plan, Row};
+use crate::protocol;
 
 /// How many sums more than it has symbols a block takes while it is whole and not yet known to be right.
 /// Each halves the packets that may be the one that was misread, so these leave no doubt.
 pub const SPARE: usize = 16;
+
+/// What an index begins with; the number is that of the layout.
+const INDEX: &[u8] = b"qqcode index 1\n";
+
+/// How long packets arrive before the index is written again. A run that is cut off, with no time to
+/// write it, has read the packets of these seconds for nothing; one that is stopped loses none.
+const INDEX_EVERY: Duration = Duration::from_secs(5);
+
+/// What an index says its files are of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kept {
+    /// Bytes in the file
+    pub length: u64,
+    /// CRC-32 of the whole file
+    pub checksum: u32,
+    /// Bytes to a packet
+    pub symbol: usize,
+}
+
+/// The bytes of an index that are still to be read.
+struct Rest<'a>(&'a [u8]);
+
+impl Rest<'_> {
+    fn take<const COUNT: usize>(&mut self) -> io::Result<[u8; COUNT]> {
+        let (taken, rest) = self
+            .0
+            .split_first_chunk()
+            .ok_or_else(|| no_index("it ends too early"))?;
+        self.0 = rest;
+        Ok(*taken)
+    }
+
+    fn u32(&mut self) -> io::Result<u32> {
+        self.take().map(u32::from_be_bytes)
+    }
+
+    fn u64(&mut self) -> io::Result<u64> {
+        self.take().map(u64::from_be_bytes)
+    }
+}
+
+fn no_index(why: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("this is no index: {why}"))
+}
+
+/// What an index says its files are of, how many bytes of sums are written, and what follows of it: the
+/// blocks.
+fn index_of(bytes: &[u8]) -> io::Result<(Kept, u64, Rest<'_>)> {
+    let rest = bytes
+        .strip_prefix(INDEX)
+        .ok_or_else(|| no_index("it does not begin as one, or it has another layout"))?;
+    let (rest, checksum) = rest
+        .split_last_chunk()
+        .ok_or_else(|| no_index("it ends too early"))?;
+    if protocol::checksum(&bytes[..bytes.len() - 4]) != u32::from_be_bytes(*checksum) {
+        return Err(no_index("its checksum is wrong"));
+    }
+    let mut rest = Rest(rest);
+    let kept = Kept {
+        length: rest.u64()?,
+        checksum: rest.u32()?,
+        symbol: rest.u64()? as usize,
+    };
+    if kept.symbol == 0 {
+        return Err(no_index("its packets have no bytes"));
+    }
+    let written = rest.u64()?;
+    Ok((kept, written, rest))
+}
 
 /// What there is of one block.
 struct Progress {
@@ -64,6 +140,11 @@ pub struct Stored {
     /// Which sections have their checksums
     sound: Vec<bool>,
     notes: Vec<Note>,
+    /// Where it is kept which packets there are, if another run is to go on with them
+    index: Option<PathBuf>,
+    /// When the index was last written, and whether a packet has arrived since
+    indexed_at: Instant,
+    unwritten: bool,
 }
 
 fn bit(bits: &[u64], at: usize) -> bool {
@@ -133,7 +214,159 @@ impl Stored {
             checks: None,
             sound: Vec::new(),
             notes: Vec::new(),
+            index: None,
+            indexed_at: Instant::now(),
+            unwritten: false,
         })
+    }
+
+    /// Keeps an index of the file in `index` from here on, for a run that goes on with it
+    /// ([`Stored::resume`]). This is for a file that was just begun: an index that is there is of
+    /// what the two files held before, and is removed.
+    pub fn indexed(mut self, index: &Path) -> io::Result<Self> {
+        match fs::remove_file(index) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        self.index = Some(index.to_owned());
+        Ok(self)
+    }
+
+    /// What the index `index` says its files are of; `None` if there is no such file.
+    pub fn kept(index: &Path) -> io::Result<Option<Kept>> {
+        match fs::read(index) {
+            Ok(bytes) => Ok(Some(index_of(&bytes)?.0)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Goes on with the file that a run before this one left in `file` and `sums`, by what `index` says
+    /// there is of it, and keeps the index from here on.
+    ///
+    /// The index is never ahead of the two files, see [`Stored::save`], so every packet it names is
+    /// there. What it calls whole is not taken on trust: with `checks`, which have to be those of the
+    /// file, every section that is whole is held against its checksum again, and one that fails is seen
+    /// to as if it had just become whole.
+    pub fn resume(file: &Path, sums: &Path, index: &Path, checks: Option<Arc<Checks>>) -> io::Result<Self> {
+        let bytes = fs::read(index)?;
+        let (kept, written, mut rest) = index_of(&bytes)?;
+        if checks
+            .as_ref()
+            .is_some_and(|checks| checks.origin.length != kept.length)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the checksums are those of a file of another length",
+            ));
+        }
+        let plan = Plan::new(kept.length, kept.symbol);
+        let mut blocks = Vec::with_capacity(plan.blocks());
+        for block in 0..plan.blocks() {
+            let size = plan.block(block);
+            let done = u8::from_be_bytes(rest.take()?) != 0;
+            let there = (0..size.div_ceil(64))
+                .map(|_| rest.u64())
+                .collect::<io::Result<Vec<_>>>()?;
+            if ones(&there).any(|at| at >= size) {
+                return Err(no_index("it has a symbol beyond the end of a block"));
+            }
+            let sums = (0..rest.u32()?)
+                .map(|_| Ok((rest.u32()?, rest.u64()?)))
+                .collect::<io::Result<Vec<_>>>()?;
+            if sums
+                .iter()
+                .any(|(_, at)| at.checked_add(kept.symbol as u64).is_none_or(|end| end > written))
+            {
+                return Err(no_index("it has a sum beyond the end of the sums"));
+            }
+            blocks.push(Progress {
+                count: ones(&there).count(),
+                there,
+                sums,
+                tried: 0,
+                done: done || size == 0,
+                settled: size == 0,
+                searched: None,
+            });
+        }
+        if !rest.0.is_empty() {
+            return Err(no_index("it goes on after its last block"));
+        }
+        let open = |path: &Path| File::options().read(true).write(true).open(path);
+        let (file, sums) = (open(file)?, open(sums)?);
+        if sums.metadata()?.len() < written {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the sums end before the last one that the index names",
+            ));
+        }
+        let mut stored = Self {
+            file,
+            sums,
+            plan,
+            checksum: kept.checksum,
+            written,
+            blocks,
+            checks: None,
+            sound: Vec::new(),
+            notes: Vec::new(),
+            index: Some(index.to_owned()),
+            indexed_at: Instant::now(),
+            unwritten: false,
+        };
+        if let Some(checks) = checks {
+            stored = stored.checked(checks);
+        }
+        for block in 0..stored.blocks.len() {
+            if stored.blocks[block].done && !stored.blocks[block].settled {
+                stored.check(block)?;
+            }
+        }
+        Ok(stored)
+    }
+
+    /// Writes the index, if one is kept and a packet has arrived since it was last written.
+    ///
+    /// The two files are on disk before the index that names what is in them, and the index takes the
+    /// place of the one before it in one step. So whatever cuts a run off, the index that the next run
+    /// finds is whole, and names nothing that is not there; what arrived after it was written is
+    /// there and not named, which costs the reading of it again and nothing else.
+    pub fn save(&mut self) -> io::Result<()> {
+        let Some(index) = &self.index else {
+            return Ok(());
+        };
+        if !self.unwritten {
+            return Ok(());
+        }
+        self.file.sync_data()?;
+        self.sums.sync_data()?;
+        let mut bytes = INDEX.to_vec();
+        bytes.extend(self.plan.length.to_be_bytes());
+        bytes.extend(self.checksum.to_be_bytes());
+        bytes.extend((self.plan.symbol as u64).to_be_bytes());
+        bytes.extend(self.written.to_be_bytes());
+        for progress in &self.blocks {
+            bytes.push(u8::from(progress.done));
+            for word in &progress.there {
+                bytes.extend(word.to_be_bytes());
+            }
+            bytes.extend((progress.sums.len() as u32).to_be_bytes());
+            for (sequence, at) in &progress.sums {
+                bytes.extend(sequence.to_be_bytes());
+                bytes.extend(at.to_be_bytes());
+            }
+        }
+        bytes.extend(protocol::checksum(&bytes).to_be_bytes());
+        let mut aside = index.clone().into_os_string();
+        aside.push(".new");
+        let mut file = File::create(&aside)?;
+        file.write_all(&bytes)?;
+        file.sync_data()?;
+        fs::rename(&aside, index)?;
+        self.indexed_at = Instant::now();
+        self.unwritten = false;
+        Ok(())
     }
 
     /// Holds the file against its checksums as it arrives. This is for a file that was just begun.
@@ -165,6 +398,17 @@ impl Stored {
     /// is not if it came before, if nothing is left to find out about its block, or if it is none of
     /// this file.
     pub fn take(&mut self, block: u32, sequence: u32, bytes: &[u8]) -> io::Result<bool> {
+        let new = self.take_in(block, sequence, bytes)?;
+        if new {
+            self.unwritten = true;
+            if self.indexed_at.elapsed() >= INDEX_EVERY {
+                self.save()?;
+            }
+        }
+        Ok(new)
+    }
+
+    fn take_in(&mut self, block: u32, sequence: u32, bytes: &[u8]) -> io::Result<bool> {
         let index = block as usize;
         let size = self.plan.block(index);
         if index >= self.blocks.len() || bytes.len() != self.plan.symbol || self.blocks[index].settled {
@@ -1378,5 +1622,320 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), file);
         fs::remove_file(&path).unwrap();
         fs::remove_file(&sums).unwrap();
+    }
+
+    /// As [`send`], to a camera whose run stops after each of the frames `stops`: another one goes on
+    /// with what it left, by the index. How many frames it takes until the file is whole.
+    fn send_in_runs(
+        bytes: &[u8],
+        symbol: usize,
+        spare: usize,
+        lost: u32,
+        section: Option<u64>,
+        stops: &[u64],
+    ) -> u64 {
+        let (file, sums) = names();
+        let index = file.with_extension("index");
+        let checks = section.map(|section| Arc::new(Checks::in_sections("f", bytes, section)));
+        let encoder = Encoder::new(bytes, 0xfeed_beef, symbol);
+        let schedule = Schedule::new(encoder.plan().clone(), spare);
+        let mut stored = Stored::create(&file, &sums, bytes.len() as u64, 0xfeed_beef, symbol)
+            .unwrap()
+            .indexed(&index)
+            .unwrap();
+        if let Some(checks) = &checks {
+            stored = stored.checked(checks.clone());
+        }
+        let (mut state, mut frame) = (77u32, 0);
+        while !stored.is_complete() {
+            if stops.contains(&frame) {
+                let before = (stored.held(), stored.received(), stored.sound());
+                stored.save().unwrap();
+                drop(stored);
+                let kept = Kept {
+                    length: bytes.len() as u64,
+                    checksum: 0xfeed_beef,
+                    symbol,
+                };
+                assert_eq!(Stored::kept(&index).unwrap(), Some(kept));
+                stored = Stored::resume(&file, &sums, &index, checks.clone()).unwrap();
+                // nothing that had arrived is missing, and every section that had its checksum has it
+                assert_eq!((stored.held(), stored.received(), stored.sound()), before);
+            }
+            let (block, sequence) = schedule.turn(frame);
+            frame += 1;
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            if state % 100 >= lost {
+                stored
+                    .take(block, sequence, &encoder.packet(block, sequence))
+                    .unwrap();
+            }
+            assert!(frame < 400_000, "the file never came together");
+        }
+        assert!(fs::read(&file).unwrap() == bytes, "the file as it was sent");
+        assert_eq!(stored.take_notes(), []);
+        fs::remove_file(&file).unwrap();
+        fs::remove_file(&sums).unwrap();
+        // there is none if the file was whole before the first stop
+        let _ = fs::remove_file(&index);
+        frame
+    }
+
+    #[test]
+    fn file_is_gone_on_with_where_the_run_before_stopped() {
+        // Three blocks of 433 symbols and a camera that misses one frame in twenty, or one in three,
+        // which takes the short rounds after the first. Wherever the runs stop, in the first block or
+        // between two, with sums waiting or without, the file is whole at the frame at which it is for
+        // a camera that never stops. The last of these stops after every frame from the 1200th on,
+        // which is with one block whole and the others not, and with some sections whole and others
+        // not.
+        let file = bytes(129_950, 21);
+        let every = (1200..3000).collect::<Vec<_>>();
+        for (lost, section) in [(5, None), (5, Some(10_000)), (33, None), (33, Some(10_000))] {
+            let straight = send(&file, 100, 10, lost, section).0;
+            assert!((1200..3000).contains(&straight), "{straight} frames");
+            for stops in [
+                &[1][..],
+                &[217, 433],
+                &[700, 701, 1250],
+                &[1400],
+                &[1500, 1700, 1900],
+                &every,
+            ] {
+                assert_eq!(
+                    send_in_runs(&file, 100, 10, lost, section, stops),
+                    straight,
+                    "{lost} in a hundred lost, sections of {section:?}, stopped after {stops:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packets_that_arrived_after_the_index_was_written_are_only_read_again() {
+        // The run is cut off, with no time to write the index: the one it wrote last is some frames
+        // old. In those frames the first block became whole and its sections got their checksums.
+        let file = bytes(129_950, 22);
+        let (path, sums) = names();
+        let index = path.with_extension("index");
+        let checks = Arc::new(Checks::in_sections("f", &file, 10_000));
+        let encoder = Encoder::new(&file, 9, 100);
+        let mut stored = Stored::create(&path, &sums, file.len() as u64, 9, 100)
+            .unwrap()
+            .indexed(&index)
+            .unwrap()
+            .checked(checks.clone());
+        // every fifth symbol of the first block is missed, and so are some of the sums
+        let seen = |sequence: &u32| !sequence.is_multiple_of(5);
+        for sequence in (0..460).filter(seen) {
+            stored.take(0, sequence, &encoder.packet(0, sequence)).unwrap();
+        }
+        assert_eq!((stored.held(), stored.sound()), (368, Some((0, 13))));
+        stored.save().unwrap();
+        for sequence in (460..560).filter(seen) {
+            stored.take(0, sequence, &encoder.packet(0, sequence)).unwrap();
+        }
+        assert_eq!((stored.held(), stored.sound()), (434, Some((4, 13))));
+        drop(stored);
+        // The index knows of none of that, and the file has it: symbols that the index does not name
+        // are not looked at, so the block is as it was when the index was written.
+        let mut stored = Stored::resume(&path, &sums, &index, Some(checks.clone())).unwrap();
+        assert_eq!((stored.held(), stored.sound()), (368, Some((0, 13))));
+        // the sums come again, and with them the block
+        for sequence in (460..560).filter(seen) {
+            assert!(stored.take(0, sequence, &encoder.packet(0, sequence)).unwrap());
+            if stored.sound() == Some((4, 13)) {
+                break;
+            }
+        }
+        assert_eq!((stored.held(), stored.sound()), (434, Some((4, 13))));
+        for block in 1..3 {
+            for sequence in 0..433 {
+                stored
+                    .take(block, sequence, &encoder.packet(block, sequence))
+                    .unwrap();
+            }
+        }
+        assert!(stored.is_complete());
+        assert_eq!(stored.take_notes(), []);
+        assert_eq!(fs::read(&path).unwrap(), file);
+        for path in [&path, &sums, &index] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn index_is_written_every_few_seconds_while_packets_arrive() {
+        let file = bytes(30_000, 23);
+        let (path, sums) = names();
+        let index = path.with_extension("index");
+        let encoder = Encoder::new(&file, 9, 100);
+        let mut stored = Stored::create(&path, &sums, 30_000, 9, 100)
+            .unwrap()
+            .indexed(&index)
+            .unwrap();
+        for sequence in 0..10 {
+            stored.take(0, sequence, &encoder.packet(0, sequence)).unwrap();
+        }
+        assert!(!index.exists(), "not with every packet");
+        // a packet that tells nothing new is no reason to write it, however long ago the last time was
+        stored.indexed_at = Instant::now().checked_sub(INDEX_EVERY).unwrap();
+        assert!(!stored.take(0, 3, &encoder.packet(0, 3)).unwrap());
+        assert!(!index.exists());
+        assert!(stored.take(0, 10, &encoder.packet(0, 10)).unwrap());
+        assert!(index.exists() && !path.with_extension("index.new").exists());
+        drop(stored);
+        let stored = Stored::resume(&path, &sums, &index, None).unwrap();
+        assert_eq!((stored.held(), stored.received()), (11, 1100));
+        // a file that is begun anew has nothing to do with the index of the one before it
+        drop(stored);
+        let stored = Stored::create(&path, &sums, 30_000, 9, 100).unwrap();
+        assert!(index.exists());
+        let mut stored = stored.indexed(&index).unwrap();
+        assert!(!index.exists());
+        // and one without an index writes none
+        let mut plain = Stored::create(&path.with_extension("plain"), &sums, 30_000, 9, 100).unwrap();
+        plain.indexed_at = Instant::now().checked_sub(INDEX_EVERY).unwrap();
+        assert!(plain.take(0, 0, &encoder.packet(0, 0)).unwrap());
+        plain.save().unwrap();
+        // nothing has arrived of the first: nothing to write down
+        stored.save().unwrap();
+        assert!(!index.exists());
+        for path in [&path, &sums, &path.with_extension("plain")] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn index_that_is_not_what_was_written_is_not_gone_on_with() {
+        let file = bytes(30_000, 24);
+        let (path, sums) = names();
+        let index = path.with_extension("index");
+        assert_eq!(Stored::kept(&index).unwrap(), None);
+        let encoder = Encoder::new(&file, 9, 100);
+        let mut stored = Stored::create(&path, &sums, 30_000, 9, 100)
+            .unwrap()
+            .indexed(&index)
+            .unwrap();
+        // symbols and sums, so that the index has both
+        for sequence in (0..40).chain(300..310) {
+            stored.take(0, sequence, &encoder.packet(0, sequence)).unwrap();
+        }
+        stored.save().unwrap();
+        drop(stored);
+        let written = fs::read(&index).unwrap();
+        let refused = |bytes: &[u8]| {
+            fs::write(&index, bytes).unwrap();
+            let kept = Stored::kept(&index).map(|_| ());
+            let resumed = Stored::resume(&path, &sums, &index, None).map(|_| ());
+            (
+                kept.map_err(|error| error.kind()),
+                resumed.map_err(|error| error.kind()),
+            )
+        };
+        let no_index = Err(io::ErrorKind::InvalidData);
+        // a byte that is off, anywhere; an index that is cut short; one of another layout
+        for at in [0, 14, 20, 40, written.len() / 2, written.len() - 1] {
+            let mut bytes = written.clone();
+            bytes[at] ^= 1;
+            assert_eq!(refused(&bytes), (no_index, no_index), "byte {at}");
+        }
+        for length in [0, 10, 30, written.len() - 1] {
+            assert_eq!(
+                refused(&written[..length]),
+                (no_index, no_index),
+                "{length} bytes"
+            );
+        }
+        // One that is whole and says what the files do not hold: the checksum of an index is no proof
+        // of where it comes from.
+        let signed = |mut bytes: Vec<u8>| {
+            let end = bytes.len() - 4;
+            let checksum = protocol::checksum(&bytes[..end]);
+            bytes[end..].copy_from_slice(&checksum.to_be_bytes());
+            bytes
+        };
+        let header = INDEX.len() + 28;
+        // a symbol beyond the 300 that the block has
+        let mut bytes = written.clone();
+        bytes[header + 1 + 4 * 8 + 1] |= 0x80;
+        assert_eq!(refused(&signed(bytes)), (Ok(()), no_index));
+        // a sum that lies beyond the sums that are written
+        let mut bytes = written.clone();
+        let sum = header + 1 + 5 * 8 + 4;
+        bytes[sum + 4..sum + 12].copy_from_slice(&1000u64.to_be_bytes());
+        assert_eq!(refused(&signed(bytes)), (Ok(()), no_index));
+        // more blocks than the file has
+        let mut bytes = written.clone();
+        bytes.splice(written.len() - 4..written.len() - 4, [0; 5]);
+        assert_eq!(refused(&signed(bytes)), (Ok(()), no_index));
+        // the index as it was written, with sums that end before the last one it names
+        fs::write(&sums, [0; 950]).unwrap();
+        assert_eq!(refused(&written), (Ok(()), Err(io::ErrorKind::UnexpectedEof)));
+        // and with the checksums of a file that is not as long
+        let other = Arc::new(Checks::in_sections("f", &file[1..], 4000));
+        fs::write(&sums, [0; 1000]).unwrap();
+        let resumed = Stored::resume(&path, &sums, &index, Some(other)).map(|_| ());
+        assert_eq!(
+            resumed.map_err(|error| error.kind()),
+            Err(io::ErrorKind::InvalidInput)
+        );
+        assert_eq!(refused(&written), (Ok(()), Ok(())));
+        for path in [&path, &sums, &index] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn packet_that_was_misread_in_one_run_is_found_in_the_next() {
+        // as in `symbol_that_was_misread_is_found_by_the_sums_that_follow`, with a run that stops when
+        // the block is whole and wrong, and before the sums have told which packet it was
+        let file = bytes(30_000, 8);
+        let (path, sums) = names();
+        let index = path.with_extension("index");
+        let checks = Arc::new(Checks::in_sections("f", &file, 4000));
+        let encoder = Encoder::new(&file, 9, 100);
+        let mut stored = Stored::create(&path, &sums, 30_000, 9, 100)
+            .unwrap()
+            .indexed(&index)
+            .unwrap()
+            .checked(checks.clone());
+        for sequence in (0..300).filter(|sequence| sequence % 7 != 0) {
+            let packet = encoder.packet(0, sequence);
+            let packet = if sequence == 40 { misread(packet) } else { packet };
+            stored.take(0, sequence, &packet).unwrap();
+        }
+        let mut next = 300;
+        while stored.take_notes().is_empty() {
+            stored.take(0, next, &encoder.packet(0, next)).unwrap();
+            next += 1;
+        }
+        assert!(!stored.is_complete());
+        let sound = stored.sound();
+        stored.save().unwrap();
+        drop(stored);
+        // The next run finds the same sections wrong, says so, and goes on looking with the sums that
+        // the first one kept.
+        let mut stored = Stored::resume(&path, &sums, &index, Some(checks)).unwrap();
+        assert_eq!(stored.sound(), sound);
+        let notes = stored.take_notes();
+        assert!(
+            matches!(notes[..], [Note::Doubted { section: 0 | 1, .. }]),
+            "{notes:?}"
+        );
+        let taken = sums_until_whole(&mut stored, &encoder, 0, next);
+        assert!(next - 300 + taken < 43 + SPARE as u32, "{taken} sums more");
+        let notes = stored.take_notes();
+        assert!(
+            matches!(notes[..], [Note::Mended { section: 0 | 1, .. }]),
+            "{notes:?}"
+        );
+        assert_eq!(stored.sound(), Some((8, 8)));
+        assert_eq!(fs::read(&path).unwrap(), file);
+        for path in [&path, &sums, &index] {
+            fs::remove_file(path).unwrap();
+        }
     }
 }
