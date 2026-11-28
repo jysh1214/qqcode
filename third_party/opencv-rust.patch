@@ -20,7 +20,7 @@
  		let link_paths = env::var("OPENCV_LINK_PATHS").ok();
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -215,6 +215,13 @@
+@@ -215,222 +215,27 @@
  xphoto = ["photo"]
  xstereo = []
  
@@ -34,19 +34,231 @@
  [lib]
  name = "opencv"
  path = "src/lib.rs"
-@@ -432,6 +439,12 @@
- name = "videoio"
- path = "tests/videoio.rs"
+ doctest = false
  
+-[[example]]
+-name = "camera_calibration"
+-path = "examples/camera_calibration.rs"
+-
+-[[example]]
+-name = "create_mask"
+-path = "examples/create_mask.rs"
+-
+-[[example]]
+-name = "cuda"
+-path = "examples/cuda.rs"
+-
+-[[example]]
+-name = "discrete_fourier_transform"
+-path = "examples/discrete_fourier_transform.rs"
+-
+-[[example]]
+-name = "dnn_face_detect"
+-path = "examples/dnn_face_detect.rs"
+-
+-[[example]]
+-name = "gapi_api_example"
+-path = "examples/gapi_api_example.rs"
+-
+-[[example]]
+-name = "hough_circle"
+-path = "examples/hough_circle.rs"
+-
+-[[example]]
+-name = "hough_lines"
+-path = "examples/hough_lines.rs"
+-
+-[[example]]
+-name = "opencl"
+-path = "examples/opencl.rs"
+-
+-[[example]]
+-name = "text_detection"
+-path = "examples/text_detection.rs"
+-
+-[[example]]
+-name = "video_capture"
+-path = "examples/video_capture.rs"
+-
+-[[example]]
+-name = "video_capture_http_stream"
+-path = "examples/video_capture_http_stream.rs"
+-
+-[[example]]
+-name = "video_facedetect"
+-path = "examples/video_facedetect.rs"
+-
+-[[example]]
+-name = "video_features"
+-path = "examples/video_features.rs"
+-
+-[[example]]
+-name = "video_to_gray"
+-path = "examples/video_to_gray.rs"
+-
+-[[example]]
+-name = "warp_perspective_demo"
+-path = "examples/warp_perspective_demo.rs"
+-
+-[[example]]
+-name = "window"
+-path = "examples/window.rs"
+-
+-[[test]]
+-name = "boxed"
+-path = "tests/boxed.rs"
+-
+-[[test]]
+-name = "boxed_ref"
+-path = "tests/boxed_ref.rs"
+-
+-[[test]]
+-name = "build"
+-path = "tests/build.rs"
+-
+-[[test]]
+-name = "cond"
+-path = "tests/cond.rs"
+-
+-[[test]]
+-name = "core"
+-path = "tests/core.rs"
+-
+-[[test]]
+-name = "core_only_latest_opencv"
+-path = "tests/core_only_latest_opencv.rs"
+-
+-[[test]]
+-name = "data_type"
+-path = "tests/data_type.rs"
+-
+-[[test]]
+-name = "dnn"
+-path = "tests/dnn.rs"
+-
+-[[test]]
+-name = "enumeration"
+-path = "tests/enumeration.rs"
+-
+-[[test]]
+-name = "enums"
+-path = "tests/enums.rs"
+-
+-[[test]]
+-name = "features2d"
+-path = "tests/features2d.rs"
+-
+-[[test]]
+-name = "imgcodecs"
+-path = "tests/imgcodecs.rs"
+-
+-[[test]]
+-name = "imgproc"
+-path = "tests/imgproc.rs"
+-
+-[[test]]
+-name = "inplace"
+-path = "tests/inplace.rs"
+-
+-[[test]]
+-name = "input_output_array"
+-path = "tests/input_output_array.rs"
+-
+-[[test]]
+-name = "marshaling"
+-path = "tests/marshaling.rs"
+-
+-[[test]]
+-name = "marshaling_only_latest_opencv"
+-path = "tests/marshaling_only_latest_opencv.rs"
+-
+-[[test]]
+-name = "mat"
+-path = "tests/mat.rs"
+-
+-[[test]]
+-name = "mat_ops"
+-path = "tests/mat_ops.rs"
+-
+-[[test]]
+-name = "matx"
+-path = "tests/matx.rs"
+-
+-[[test]]
+-name = "ml"
+-path = "tests/ml.rs"
+-
+-[[test]]
+-name = "objdetect"
+-path = "tests/objdetect.rs"
+-
+-[[test]]
+-name = "opencl"
+-path = "tests/opencl.rs"
+-
+-[[test]]
+-name = "path"
+-path = "tests/path.rs"
+-
+-[[test]]
+-name = "point"
+-path = "tests/point.rs"
+-
+-[[test]]
+-name = "point3"
+-path = "tests/point3.rs"
+-
+-[[test]]
+-name = "rect"
+-path = "tests/rect.rs"
+-
+-[[test]]
+-name = "size"
+-path = "tests/size.rs"
+-
+-[[test]]
+-name = "slice"
+-path = "tests/slice.rs"
+-
+-[[test]]
+-name = "slice_from_null"
+-path = "tests/slice_from_null.rs"
+-
+-[[test]]
+-name = "smart_ptr"
+-path = "tests/smart_ptr.rs"
+-
+-[[test]]
+-name = "stitching"
+-path = "tests/stitching.rs"
+-
+-[[test]]
+-name = "umat"
+-path = "tests/umat.rs"
+-
+-[[test]]
+-name = "vec"
+-path = "tests/vec.rs"
+-
+-[[test]]
+-name = "vector"
+-path = "tests/vector.rs"
+-
+-[[test]]
+-name = "videoio"
+-path = "tests/videoio.rs"
++# qqcode patch: the `[[example]]` and `[[test]]` sections that stood here are taken out, as `examples/` and
++# `tests/` are not in this copy and `cargo fmt --all` in the parent workspace fails on a target whose file is
++# missing
++
 +# qqcode patch: OpenCV itself is compiled from third_party/opencv by `opencv-vendored`. Depending on it makes
 +# cargo finish that build before this crate's build script runs and hands its location over as
 +# `DEP_OPENCV_VENDORED_*`.
 +[dependencies.opencv-vendored]
 +path = "../../crates/opencv-vendored"
-+
+ 
  [dependencies.half]
  version = "2"
- optional = true
 --- a/rustfmt.toml
 +++ b/rustfmt.toml
 @@ -0,0 +1,2 @@

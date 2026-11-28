@@ -24,19 +24,27 @@ crate's build script runs. Cargo only orders build scripts along dependency edge
 no dependency that could build OpenCV for it. That is why a copy of the crate lives here with a small patch:
 
 - `Cargo.toml`: a dependency on `opencv-vendored`, which gives cargo the ordering and passes the install
-  location on as `DEP_OPENCV_VENDORED_*`; and three lints switched off that fire with few modules enabled;
+  location on as `DEP_OPENCV_VENDORED_*`; three lints switched off that fire with few modules enabled; and
+  the `[[example]]` and `[[test]]` sections taken out, see below;
 - `build/library.rs`: use that location, and only that one, instead of probing the system for an OpenCV;
 - `rustfmt.toml`: keeps `cargo fmt --all` from reformatting the copy.
 
-The `docs/` directory of the published crate (pre-generated bindings for docs.rs, 16 MB) is left out.
+What the build does not take of the published crate is left out: `docs/` (pre-generated bindings for docs.rs,
+16 MB), `examples/`, `tests/`, and `AGENTS.md`, `CHANGES.md`, `INSTALL.md` and `TROUBLESHOOTING.md`. Cargo
+builds neither the examples nor the tests of a dependency, but `cargo fmt --all` fails on a target whose file
+is missing, which is why their sections are out of `Cargo.toml` as well.
 
 ## Updating
 
 OpenCV: check out the new tag in the submodule. The next `cargo build` notices the new revision and rebuilds.
 
-`opencv` crate: replace `opencv-rust/` with the new release from crates.io (without `docs/`) and re-apply the
-patch from inside it:
+`opencv` crate: replace `opencv-rust/` with the new release from crates.io, without what is left out, and
+re-apply the patch from inside it:
 
 ```sh
 patch -p1 < ../opencv-rust.patch
 ```
+
+A release with other examples or tests than 0.102.0 has other sections in `Cargo.toml`, and that part of the
+patch no longer applies: every `[[example]]` and `[[test]]` section is taken out by hand then, and the patch
+written anew.
