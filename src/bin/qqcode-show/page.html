@@ -24,68 +24,79 @@
 <script>
 "use strict";
 // What qqcode-show computes in Rust for its tests is computed here for the screen: src/tiles.rs,
-// src/fountain.rs, src/packet.rs and src/rs.rs say why, this says it again in JavaScript, and the two have
+// src/fountain.rs, src/packet.rs and src/ldpc.rs say why, this says it again in JavaScript, and the two have
 // to agree to the bit.
 
-// ---- Reed-Solomon over GF(256), src/rs.rs
-const EXP = new Uint8Array(510), LOG = new Uint8Array(256);
-for (let power = 0, value = 1; power < 255; power++) {
-  EXP[power] = EXP[power + 255] = value;
-  LOG[value] = power;
-  value <<= 1;
-  if (value & 0x100) value ^= 0x11d;
+// ---- the check bits of a frame, src/ldpc.rs
+// the sequence of numbers that a code is made from
+function draw(seed) {
+  let state = seed | 0;
+  return () => {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    return state >>> 0;
+  };
 }
-const multiply = (a, b) => (a && b ? EXP[LOG[a] + LOG[b]] : 0);
 
-function generator(parity) {
-  const poly = [1];
-  for (let root = 0; root < parity; root++) {
-    poly.push(0);
-    for (let index = poly.length - 1; index >= 1; index--) poly[index] ^= multiply(poly[index - 1], EXP[root % 255]);
+// the numbers from 0 to `count` less one, in no order
+function order(next, count) {
+  const order = new Uint32Array(count);
+  for (let index = 0; index < count; index++) order[index] = index;
+  for (let last = count - 1; last >= 1; last--) {
+    const other = next() % (last + 1), kept = order[last];
+    order[last] = order[other];
+    order[other] = kept;
   }
-  return Uint8Array.from(poly.slice(1));
+  return order;
 }
 
-function checkBytes(data, poly) {
-  const parity = poly.length, check = new Uint8Array(parity);
-  for (const byte of data) {
-    const factor = byte ^ check[0];
-    check.copyWithin(0, 1);
-    check[parity - 1] = 0;
-    if (factor) for (let index = 0; index < parity; index++) check[index] ^= multiply(poly[index], factor);
+// a code of words of `bits` bits, of which `data` are data: which bits of the data each check has
+class Code {
+  constructor(bits, data) {
+    const few = 3, many = 13, more = 10, checks = bits - data, next = draw(0x2545f491);
+    const ofBit = new Int32Array(data * many).fill(-1), sizes = new Uint32Array(checks);
+    let turn = 0;
+    for (let round = 0; round < many; round++) {
+      for (const bit of order(next, round < few ? data : Math.floor(data / more))) {
+        const own = ofBit.subarray(bit * many, bit * many + round);
+        let check = turn % checks;
+        // a bit that would come into a check twice takes the next check
+        while (own.includes(check)) check = (check + 1) % checks;
+        ofBit[bit * many + round] = check;
+        sizes[check]++;
+        turn++;
+      }
+    }
+    this.bits = bits;
+    this.data = data;
+    this.starts = new Uint32Array(checks + 1);
+    for (let check = 0; check < checks; check++) this.starts[check + 1] = this.starts[check] + sizes[check];
+    this.members = new Uint32Array(this.starts[checks]);
+    const filled = new Uint32Array(checks);
+    for (let bit = 0; bit < data; bit++) {
+      for (let round = 0; round < many; round++) {
+        const check = ofBit[bit * many + round];
+        if (check >= 0) this.members[this.starts[check] + filled[check]++] = bit;
+      }
+    }
   }
-  return check;
-}
 
-// ---- the planes of a frame, src/tiles.rs
-function wordLengths(bytes) {
-  const count = Math.ceil(bytes / 255), lengths = [];
-  for (let word = 0; word < count; word++) lengths.push(Math.floor(bytes / count) + (word < bytes % count ? 1 : 0));
-  return lengths;
-}
-
-function planeData(bytes, parity) {
-  return bytes - wordLengths(bytes).length * parity;
-}
-
-function encodePlane(data, bytes, poly) {
-  const parity = poly.length, words = [];
-  let at = 0;
-  for (const length of wordLengths(bytes)) {
-    const word = new Uint8Array(length), own = data.subarray(at, at + length - parity);
-    word.set(own);
-    word.set(checkBytes(own, poly), length - parity);
-    words.push(word);
-    at += length - parity;
+  // the code word of the bits of these bytes, a byte for every bit: the data, and then for every check
+  // the check bit before it plus the bits of the data that the check has
+  encode(bytes) {
+    const word = new Uint8Array(this.bits), checks = this.bits - this.data;
+    for (let bit = 0; bit < this.data; bit++) word[bit] = (bytes[bit >> 3] >> (7 - (bit & 7))) & 1;
+    let before = 0;
+    for (let check = 0; check < checks; check++) {
+      for (let at = this.starts[check]; at < this.starts[check + 1]; at++) before ^= word[this.members[at]];
+      word[this.data + check] = before;
+    }
+    return word;
   }
-  const plane = new Uint8Array(bytes);
-  let next = 0;
-  for (let place = 0; words.length && place < words[0].length; place++) {
-    for (const word of words) if (place < word.length) plane[next++] = word[place];
-  }
-  return plane;
 }
 
+// ---- the tiles of a frame, src/tiles.rs
 function mix(bytes, state) {
   for (let index = 0; index < bytes.length; index++) {
     state ^= state << 13;
@@ -110,25 +121,20 @@ class Matrix {
       }
     }
     this.tiles = this.cells.length;
-    this.symbolBytes = Math.floor(this.tiles / 2);
-    this.colourBytes = Math.floor(this.tiles / 4);
-    this.symbolPoly = generator(this.symbolParity);
-    this.colourPoly = generator(this.colourParity);
-    this.symbolData = planeData(this.symbolBytes, this.symbolParity);
-    this.capacity = this.symbolData + planeData(this.colourBytes, this.colourParity);
+    this.capacity = Math.floor(Math.floor(this.tiles * this.bits * this.data[0] / this.data[1]) / 8);
+    this.code = new Code(this.tiles * this.bits, 8 * this.capacity);
+    // the place among the bits of the tiles that each bit of a code word has
+    this.places = order(draw(0x6c078965), this.tiles * this.bits);
   }
 
   // the tiles of the frame that holds `payload`: its symbol times four plus its colour for every cell
   pack(payload) {
-    const symbols = encodePlane(payload.subarray(0, this.symbolData), this.symbolBytes, this.symbolPoly);
-    const colours = encodePlane(payload.subarray(this.symbolData), this.colourBytes, this.colourPoly);
-    mix(colours, mix(symbols, 0x9e3779b9 | 0));
-    const tiles = new Uint8Array(this.tiles);
-    for (let tile = 0; tile < this.tiles; tile++) {
-      const symbol = (tile >> 1) < symbols.length ? (symbols[tile >> 1] >> (4 - 4 * (tile % 2))) & 15 : 0;
-      const colour = (tile >> 2) < colours.length ? (colours[tile >> 2] >> (6 - 2 * (tile % 4))) & 3 : 0;
-      tiles[tile] = symbol << 2 | colour;
+    const word = this.code.encode(payload), tiles = new Uint8Array(this.tiles);
+    for (let bit = 0; bit < word.length; bit++) {
+      if (word[bit]) tiles[Math.floor(this.places[bit] / this.bits)] |= 1 << (this.bits - 1 - this.places[bit] % this.bits);
     }
+    mix(tiles, 0x9e3779b9 | 0);
+    for (let tile = 0; tile < tiles.length; tile++) tiles[tile] &= 63;
     return tiles;
   }
 }

@@ -29,7 +29,7 @@ pub struct Found {
     /// What its frame says, or `None` if it could not be read: too small in the frame, blurred,
     /// outshone, or caught while the page changed
     pub frame: Option<Frame>,
-    /// The share of its bytes that were misread and put right
+    /// The share of its tiles that were misread and put right
     pub wrong: f32,
 }
 

@@ -1,8 +1,10 @@
 //! Reads the matrix of tiles ([`crate::tiles`]) out of a frame of the camera.
 //!
 //! The four finder patterns in the corners of the matrix say where it is. The frame is laid flat by them,
-//! at the size the matrix has on the page, and then read tile by tile: which of the sixteen symbols a tile
-//! looks most like, and which of the four colours its light has.
+//! at the size the matrix has on the page, and then read tile by tile: how like each of the sixteen symbols
+//! a tile looks, and how near its light is to each of the four colours. What comes of that is not a symbol
+//! and a colour for the tile but how sure each of its six bits is, which is what the check bits of a frame
+//! ([`crate::ldpc`]) put it right from.
 //!
 //! A lens bends what the four corners can't account for, by a few pixels in the middle of a large matrix.
 //! So no tile is read where it ought to be, but where it is found. One tile can't tell: a symbol that is
@@ -18,7 +20,7 @@ use opencv::imgproc;
 use opencv::prelude::*;
 
 use crate::packet::Frame;
-use crate::tiles::{self, ANCHOR, Grid, MODULE, PITCH, SCALES, SUB, Shape, TILE};
+use crate::tiles::{self, ANCHOR, Grid, MODULE, PITCH, SCALES, SUB, Shape, Sure, TILE};
 
 /// A finder pattern in a frame: its middle and how many pixels it is across.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -49,7 +51,7 @@ pub struct Sighted {
     /// Tiles along the longer side of the matrix; of a matrix that is not read, going by the size of its
     /// finder patterns
     pub tiles: usize,
-    /// The share of the bytes of a frame that were misread and put right
+    /// The share of the tiles of a frame that were misread and put right
     pub wrong: f32,
 }
 
@@ -203,8 +205,8 @@ fn attempt(frame: &Mat, anchors: &[Point2f; 4], grid: Grid) -> Result<Option<Rea
     if flat.channels() != 3 || !flat.is_continuous() {
         return Ok(None);
     }
-    let values = read_tiles(flat.data_bytes()?, grid);
-    let Some(unpacked) = tiles::unpack(grid, &values) else {
+    let sure = read_tiles(flat.data_bytes()?, grid);
+    let Some(unpacked) = tiles::unpack(grid, &sure) else {
         return Ok(None);
     };
     let Some(frame) = Frame::parse(&unpacked.payload) else {
@@ -220,7 +222,7 @@ fn attempt(frame: &Mat, anchors: &[Point2f; 4], grid: Grid) -> Result<Option<Rea
     Ok(Some(Reading {
         frame,
         outline: std::array::from_fn(|corner| outline.get(corner).expect("four corners")),
-        wrong: unpacked.wrong as f32 / unpacked.bytes as f32,
+        wrong: unpacked.wrong as f32 / unpacked.tiles as f32,
     }))
 }
 
@@ -245,9 +247,13 @@ struct Match {
     best: i32,
 }
 
-/// The tiles of the flat picture of a matrix, which has blue, green and red for every pixel: a value
-/// from 0 to 63 for every cell, as [`tiles::pack`] has them.
-pub fn read_tiles(flat: &[u8], grid: Grid) -> Vec<u8> {
+/// How sure a bit may be at most: a tile that is misread for all that it looks right, under a reflection
+/// or between two frames, must not outweigh the checks that say so.
+const SUREST: f32 = 12.0;
+
+/// The tiles of the flat picture of a matrix, which has blue, green and red for every pixel: how sure each
+/// of the six bits is that a cell has, as [`tiles::pack`] has them.
+pub fn read_tiles(flat: &[u8], grid: Grid) -> Vec<Sure> {
     let (width, height) = (grid.width(), grid.height());
     assert_eq!(
         flat.len(),
@@ -544,12 +550,27 @@ pub fn read_tiles(flat: &[u8], grid: Grid) -> Vec<u8> {
             }
         }
     }
-    let mut symbols = vec![0u8; grid.columns * grid.rows];
-    for ((column, row), found) in grid.cells().zip(&seen) {
-        let pattern = pattern_of(&found.likeness, &strength);
-        let exchanged = if found.likeness[pattern] < 0 { 8 } else { 0 };
-        symbols[cell(column, row)] = pattern as u8 | exchanged;
+    // How like each of the eight patterns a tile is, with a like tile at about 1, or at -1 with lit and dark
+    // exchanged. The patterns that a tile is not are then as far from 0 as the picture is off, and how far
+    // that is in this picture says what a likeness is worth: a tile that is 0.2 nearer to one pattern than
+    // to the next is sure of it in a sharp picture and not in a blurred one.
+    let scores = seen
+        .iter()
+        .map(|found| {
+            std::array::from_fn::<f32, 8, _>(|pattern| found.likeness[pattern] as f32 / strength[pattern])
+        })
+        .collect::<Vec<_>>();
+    let (mut off, mut count) = (0f64, 0usize);
+    for score in &scores {
+        let taken = pattern_of_scores(score);
+        for (pattern, value) in score.iter().enumerate() {
+            if pattern != taken {
+                off += (*value as f64) * (*value as f64);
+                count += 1;
+            }
+        }
     }
+    let symbol_weight = 1.0 / (off / count.max(1) as f64).max(1e-6) as f32;
 
     // The colour of each tile: all the light there is in it, with its brightest channel as 1. The dark half
     // of a tile adds nothing to that on the page, and in a frame it has what a camera lets the colour of
@@ -573,11 +594,32 @@ pub fn read_tiles(flat: &[u8], grid: Grid) -> Vec<u8> {
         let brightest = light.iter().copied().fold(1.0, f32::max);
         tints.push(light.map(|channel| channel / brightest));
     }
-    let colours = classify(&tints);
+    // How far the light of a tile is from each of the four colours as this picture has them, and what
+    // that is worth, which again is by how far the tiles are from the colours that they are.
+    let centres = centres(&tints);
+    let apart = tints
+        .iter()
+        .map(|tint| centres.map(|centre| distance_of(&centre, tint)))
+        .collect::<Vec<_>>();
+    let nearest = apart
+        .iter()
+        .map(|apart| apart.iter().copied().fold(f32::MAX, f32::min) as f64)
+        .sum::<f64>();
+    let colour_weight = 1.0 / (nearest / apart.len().max(1) as f64).max(1e-6) as f32;
 
-    grid.cells()
-        .zip(colours)
-        .map(|((column, row), colour)| symbols[cell(column, row)] << 2 | colour)
+    scores
+        .iter()
+        .zip(&apart)
+        .map(|(score, apart)| {
+            let symbol = symbol_bits(score).map(|bit| symbol_weight * bit);
+            let colour = [
+                apart[2].min(apart[3]) - apart[0].min(apart[1]),
+                apart[1].min(apart[3]) - apart[0].min(apart[2]),
+            ]
+            .map(|bit| colour_weight * bit);
+            let bits = [symbol[0], symbol[1], symbol[2], symbol[3], colour[0], colour[1]];
+            bits.map(|bit| bit.clamp(-SUREST, SUREST))
+        })
         .collect()
 }
 
@@ -676,6 +718,32 @@ impl Bend {
     }
 }
 
+/// The pattern that a tile is most like, going by its likenesses in units of their strengths.
+fn pattern_of_scores(score: &[f32; 8]) -> usize {
+    (0..8)
+        .max_by(|a, b| score[*a].abs().total_cmp(&score[*b].abs()))
+        .expect("eight patterns")
+}
+
+/// What the likenesses of a tile say of the four bits of its symbol, the first of which is whether lit and
+/// dark are exchanged and the others the number of the pattern: for each bit, how much more like the tile
+/// is to the likeliest symbol that has a 0 there than to the likeliest that has a 1.
+fn symbol_bits(score: &[f32; 8]) -> [f32; 4] {
+    let most = score.iter().copied().fold(f32::MIN, f32::max);
+    let least = score.iter().copied().fold(f32::MAX, f32::min);
+    let mut bits = [most + least, 0.0, 0.0, 0.0];
+    for bit in 0..3 {
+        let side = |one: bool| {
+            (0..8)
+                .filter(|pattern| (pattern >> (2 - bit) & 1 == 1) == one)
+                .map(|pattern| score[pattern].abs())
+                .fold(0.0, f32::max)
+        };
+        bits[1 + bit] = side(false) - side(true);
+    }
+    bits
+}
+
 /// The pattern that a tile is most like, each likeness taken by the strength of its pattern.
 fn pattern_of(likeness: &[i32; 8], strength: &[f32; 8]) -> usize {
     let weighed = |pattern: usize| likeness[pattern].abs() as f32 / strength[pattern];
@@ -688,26 +756,43 @@ fn pattern_of(likeness: &[i32; 8], strength: &[f32; 8]) -> usize {
 /// be taken at its word about where its colours are.
 const APART: f32 = 0.2;
 
-/// Which of the four colours each tint is. The colours are those of the page as a camera sees them, which
-/// is not as they are on the page: one camera has two thirds of the red in a cyan tile that it has in the
-/// white tile next to it. So the four begin where this frame has them, as far as it shows that: a channel
-/// that the tiles have in two [`groups`] says how much of it white has, and how much the colour that
-/// lacks it. Where a channel says nothing, they begin as they ought to be. They are then moved, a few
-/// times over, to the middle of the tints that are nearest to each.
+/// How far a tint is from a colour, squared.
+fn distance_of(centre: &[f32; 3], tint: &[f32; 3]) -> f32 {
+    centre.iter().zip(tint).map(|(a, b)| (a - b) * (a - b)).sum()
+}
+
+/// Which of the four colours each tint is nearest to, as [`centres`] has them.
+#[cfg(test)]
 fn classify(tints: &[[f32; 3]]) -> Vec<u8> {
+    let centres = centres(tints);
+    tints
+        .iter()
+        .map(|tint| {
+            (0..4u8)
+                .min_by(|a, b| {
+                    distance_of(&centres[*a as usize], tint)
+                        .total_cmp(&distance_of(&centres[*b as usize], tint))
+                })
+                .expect("four colours")
+        })
+        .collect()
+}
+
+/// Where the four colours are among these tints. The colours are those of the page as a camera sees them,
+/// which is not as they are on the page: one camera has two thirds of the red in a cyan tile that it has
+/// in the white tile next to it. So the four begin where this frame has them, as far as it shows that: a
+/// channel that the tiles have in two [`groups`] says how much of it white has, and how much the colour
+/// that lacks it. Where a channel says nothing, they begin as they ought to be. They are then moved, a few
+/// times over, to the middle of the tints that are nearest to each.
+fn centres(tints: &[[f32; 3]]) -> [[f32; 3]; 4] {
     // blue, green, red, as the frame has them
     let pure: [[f32; 3]; 4] =
         tiles::COLOURS.map(|[red, green, blue]| [blue, green, red].map(|c| c as f32 / 255.0));
     let nearest = |centres: &[[f32; 3]; 4], tint: &[f32; 3]| {
-        let off = |centre: &[f32; 3]| {
-            centre
-                .iter()
-                .zip(tint)
-                .map(|(a, b)| (a - b) * (a - b))
-                .sum::<f32>()
-        };
         (0..4u8)
-            .min_by(|a, b| off(&centres[*a as usize]).total_cmp(&off(&centres[*b as usize])))
+            .min_by(|a, b| {
+                distance_of(&centres[*a as usize], tint).total_cmp(&distance_of(&centres[*b as usize], tint))
+            })
             .expect("four colours")
     };
     let mut begin = pure;
@@ -733,19 +818,14 @@ fn classify(tints: &[[f32; 3]]) -> Vec<u8> {
             // a colour that hardly any tile has stays where it was
             if counts[colour] >= 16 {
                 let moved = sums[colour].map(|sum| sum / counts[colour] as f32);
-                let off = moved
-                    .iter()
-                    .zip(&begin[colour])
-                    .map(|(a, b)| (a - b) * (a - b))
-                    .sum::<f32>();
                 // and none goes over to where another one belongs
-                if off < 0.6 * 0.6 {
+                if distance_of(&moved, &begin[colour]) < 0.6 * 0.6 {
                     centres[colour] = moved;
                 }
             }
         }
     }
-    tints.iter().map(|tint| nearest(&centres, tint)).collect()
+    centres
 }
 
 /// The two groups that the tiles are in by how much they have of one channel, if they are in two: the
@@ -864,7 +944,10 @@ mod tests {
     fn tiles_are_read_from_the_picture_of_the_page() {
         for grid in [Grid::new(Shape::Square, 4), Grid::new(Shape::Wide, 11)] {
             let values = values(grid, 3);
-            assert_eq!(read_tiles(&picture(grid, &values), grid), values);
+            assert_eq!(
+                tiles::likeliest(&read_tiles(&picture(grid, &values), grid)),
+                values
+            );
         }
     }
 
@@ -897,11 +980,12 @@ mod tests {
             core::BORDER_CONSTANT,
             Scalar::all(0.0),
         )?;
-        let read = read_tiles(bent.data_bytes()?, grid);
+        let sure = read_tiles(bent.data_bytes()?, grid);
+        let read = tiles::likeliest(&sure);
         let wrong = read.iter().zip(&values).filter(|(a, b)| a != b).count();
-        // a tile here and there, which the check bytes make up for
+        // a tile here and there, which the check bits make up for
         assert!(wrong * 100 < values.len(), "{wrong} of {}", values.len());
-        assert!(tiles::unpack(grid, &read).is_some());
+        assert!(tiles::unpack(grid, &sure).is_some());
         Ok(())
     }
 
@@ -955,10 +1039,11 @@ mod tests {
             core::BORDER_CONSTANT,
             Scalar::all(0.0),
         )?;
-        let read = read_tiles(bent.data_bytes()?, grid);
+        let sure = read_tiles(bent.data_bytes()?, grid);
+        let read = tiles::likeliest(&sure);
         let wrong = read.iter().zip(&values).filter(|(a, b)| a != b).count();
         assert!(wrong * 50 < values.len(), "{wrong} of {}", values.len());
-        assert!(tiles::unpack(grid, &read).is_some());
+        assert!(tiles::unpack(grid, &sure).is_some());
         Ok(())
     }
 
@@ -991,10 +1076,11 @@ mod tests {
             core::BORDER_CONSTANT,
             Scalar::all(0.0),
         )?;
-        let read = read_tiles(bent.data_bytes()?, grid);
+        let sure = read_tiles(bent.data_bytes()?, grid);
+        let read = tiles::likeliest(&sure);
         let wrong = read.iter().zip(&values).filter(|(a, b)| a != b).count();
         assert!(wrong * 100 < values.len(), "{wrong} of {}", values.len());
-        assert!(tiles::unpack(grid, &read).is_some());
+        assert!(tiles::unpack(grid, &sure).is_some());
         Ok(())
     }
 
@@ -1148,11 +1234,11 @@ mod tests {
             assert!(!grid.rows.is_multiple_of(AREA) || !grid.columns.is_multiple_of(AREA));
             for seed in 0..3 {
                 let values = values(grid, seed);
-                let read = read_tiles(blurred(grid, &values, 1.6)?.data_bytes()?, grid);
+                let read = tiles::likeliest(&read_tiles(blurred(grid, &values, 1.6)?.data_bytes()?, grid));
                 let wrong = read.iter().zip(&values).filter(|(a, b)| a != b).count();
                 assert!(wrong * 1000 < values.len(), "{shape:?}, picture {seed}: {wrong}");
                 // more out of focus, some tiles are misread, and none because it is looked for elsewhere
-                let read = read_tiles(blurred(grid, &values, 2.0)?.data_bytes()?, grid);
+                let read = tiles::likeliest(&read_tiles(blurred(grid, &values, 2.0)?.data_bytes()?, grid));
                 let wrong = read.iter().zip(&values).filter(|(a, b)| a != b).count();
                 assert!(
                     wrong * 100 < 6 * values.len(),

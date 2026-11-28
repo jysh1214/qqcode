@@ -143,7 +143,7 @@ pub fn page(name: &str, origin: Origin, held: Option<&[u8]>, format: Format) -> 
     let meta = format!(
         "{{\"name\":\"{}\",\"checksum\":{},\"length\":{},\"embedded\":{},\"pace\":{},\"plan\":{{\"block\":{},\
          \"group\":{},\"spare\":{},\"again\":{}}},\"colours\":[{}],\"matrix\":{{\"columns\":{},\"rows\":{},\"pitch\":{},\
-         \"sub\":{},\"border\":{},\"anchor\":{},\"module\":{},\"symbolParity\":{},\"colourParity\":{}}}}}",
+         \"sub\":{},\"border\":{},\"anchor\":{},\"module\":{},\"bits\":{},\"data\":[{},{}]}}}}",
         json(name),
         origin.checksum,
         origin.length,
@@ -161,8 +161,9 @@ pub fn page(name: &str, origin: Origin, held: Option<&[u8]>, format: Format) -> 
         tiles::BORDER,
         tiles::ANCHOR,
         tiles::MODULE,
-        tiles::SYMBOL_PARITY,
-        tiles::COLOUR_PARITY,
+        tiles::BITS,
+        tiles::DATA.0,
+        tiles::DATA.1,
     );
     TEMPLATE
         .replace("{{TITLE}}", &html(name))
@@ -370,7 +371,7 @@ mod tests {
             "{{\"name\":\"notes.bin\",\"checksum\":{},\"length\":1000,\"embedded\":true,\"pace\":20,\"plan\":{{\"block\":512,\
              \"group\":16,\"spare\":25,\"again\":10}},\"colours\":[[255,255,255],[0,255,255],[255,0,255],[255,255,0]],\
              \"matrix\":{{\"columns\":176,\"rows\":99,\"pitch\":9,\"sub\":2,\"border\":4,\"anchor\":6,\"module\":6,\
-             \"symbolParity\":64,\"colourParity\":40}}}}",
+             \"bits\":6,\"data\":[3,4]}}}}",
             origin.checksum
         )));
         // a page that asks for its file has all of that but the file
@@ -385,10 +386,10 @@ mod tests {
     fn show_is_the_start_screen_and_then_the_packets_by_turns() {
         let file = bytes(3000);
         let square = format(Shape::Square, 4);
-        // 592 bytes a frame, 27 of which are not the packet
-        assert_eq!(square.grid.capacity(), 592);
+        // 648 bytes a frame, 27 of which are not the packet
+        assert_eq!(square.grid.capacity(), 648);
         let show = Show::new("notes.bin", &file, square);
-        assert_eq!(show.frames(), 6);
+        assert_eq!(show.frames(), 5);
         assert_eq!(
             show.frame(None),
             Frame::Start {
@@ -405,7 +406,7 @@ mod tests {
         else {
             panic!("a packet");
         };
-        assert_eq!((block, sequence, &bytes[..]), (0, 2, &file[1130..1695]));
+        assert_eq!((block, sequence, &bytes[..]), (0, 2, &file[1242..1863]));
         assert!(matches!(
             show.frame(Some(1000)),
             Frame::Packet { sequence: 1000, .. }
@@ -482,14 +483,14 @@ mod tests {
         );
         assert_eq!(
             text,
-            "wrote show.html: notes.bin, 3000000 bytes in 298 frames of 10077 bytes, 15 a second: 151 kB a second, \
-             20 s if every frame is read\n\
-             the first round is 373 frames, 25 s, with 25 sums to spare in a hundred; the rounds after it are \
-             sums alone, 75 frames, 5 s each; the file is in the page\n\
+            "wrote show.html: notes.bin, 3000000 bytes in 310 frames of 9693 bytes, 15 a second: 145 kB a second, \
+             21 s if every frame is read\n\
+             the first round is 388 frames, 26 s, with 25 sums to spare in a hundred; the rounds after it are \
+             sums alone, 78 frames, 6 s each; the file is in the page\n\
              matrix of 176x99 tiles, 1592x899 px: best shown at that size or a whole multiple of it, and filling \
              the frames of the camera"
         );
-        // ten thousand million bytes: 1939 blocks in 122 groups, of which the page reads one at a time
+        // ten thousand million bytes: 2015 blocks in 126 groups, of which the page reads one at a time
         let long = Origin {
             checksum: 1,
             length: 10_000_000_000,
@@ -503,11 +504,11 @@ mod tests {
         );
         assert!(
             text.starts_with(
-                "wrote show.html: disk.img, 10000000000 bytes in 992359 frames of 10077 bytes, 15 a second: 151 kB a \
-                 second, 22 h 57 min if every frame is read\n\
-                 the first round is 1240557 frames, 22 h 58 min, with 25 sums to spare in a hundred; the rounds \
-                 after it are sums alone, 248192 frames, 4 h 35 min each; the page asks for the file when it is \
-                 opened, and reads it 83 MB at a time\n"
+                "wrote show.html: disk.img, 10000000000 bytes in 1031673 frames of 9693 bytes, 15 a second: 145 kB a \
+                 second, 23 h 50 min if every frame is read\n\
+                 the first round is 1289600 frames, 23 h 52 min, with 25 sums to spare in a hundred; the rounds \
+                 after it are sums alone, 257920 frames, 4 h 46 min each; the page asks for the file when it is \
+                 opened, and reads it 80 MB at a time\n"
             ),
             "{text}"
         );
@@ -540,9 +541,9 @@ mod tests {
     fn page_computes_the_tiles_that_the_library_does() {
         // 18 blocks, so two groups, the last symbol short, and a name that is cut in the middle of a
         // character
-        let file = bytes(5_000_123);
+        let file = bytes(5_495_352);
         let square = format(Shape::Square, 4);
-        let name = format!("{}ü.bin", "n".repeat(540));
+        let name = format!("{}ü.bin", "n".repeat(618));
         let show = Show::new(&name, &file, square);
         assert_eq!(show.frames(), 8850);
         // the first group and its sums, the second group, the end of a round and the rounds after it

@@ -61,7 +61,7 @@ pub struct Sighting {
     pub modules: usize,
     /// Pixels of the frame to a tile
     pub module_size: f32,
-    /// The share of its bytes that were misread and put right
+    /// The share of its tiles that were misread and put right
     pub wrong: f32,
 }
 

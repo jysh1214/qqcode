@@ -76,8 +76,8 @@ qqcode-show assets/sample.bin --html show.html --shape classic       # for a cam
 qqcode-show sample.bin.checksums.txt --html list.html                # the checksums, to go ahead of the file
 ```
 
-The page shows a matrix of coloured tiles, frame after frame without end: 10 kB of the file in a frame and
-151 kB a second by default. Any frames that are enough make the file, so one that the camera misses costs
+The page shows a matrix of coloured tiles, frame after frame without end: 9.7 kB of the file in a frame and
+145 kB a second by default. Any frames that are enough make the file, so one that the camera misses costs
 nothing. The matrix is best shown filling the frames of the camera; where frames are not read, a smaller
 `--scale` or a camera nearer to the screen is the first thing to try.
 

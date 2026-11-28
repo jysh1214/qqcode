@@ -29,7 +29,7 @@ fn bytes(count: usize, seed: u64) -> Vec<u8> {
     (0..count).map(|_| next()).collect()
 }
 
-/// The matrix of the web page that these tests show: 128 by 72 tiles, 5265 bytes of a file in a frame.
+/// The matrix of the web page that these tests show: 128 by 72 tiles, 5076 bytes of a file in a frame.
 const GRID: Grid = Grid {
     columns: 128,
     rows: 72,
@@ -90,7 +90,7 @@ fn reads_a_web_page_from_its_start_screen_to_the_file() -> Result<()> {
         Outcome::Packet { new: true }
     );
     assert_eq!(pipeline.packets(), Some((3, 4)));
-    assert_eq!(pipeline.received(), Some(3 * 5265));
+    assert_eq!(pipeline.received(), Some(3 * 5076));
     assert_eq!(
         (pipeline.name(), pipeline.file()),
         (Some("notes.bin"), Some(Origin::of(&file)))
@@ -125,10 +125,10 @@ fn file_of_a_web_page_is_put_together_on_disk() -> Result<()> {
     // what arrived is in its place already, and what did not is a hole
     let so_far = fs::read(&part)?;
     assert_eq!(
-        (&so_far[..2 * 5265], &so_far[3 * 5265..5 * 5265]),
-        (&file[..2 * 5265], &file[3 * 5265..5 * 5265])
+        (&so_far[..2 * 5076], &so_far[3 * 5076..5 * 5076]),
+        (&file[..2 * 5076], &file[3 * 5076..5 * 5076])
     );
-    assert!(so_far[2 * 5265..3 * 5265].iter().all(|byte| *byte == 0));
+    assert!(so_far[2 * 5076..3 * 5076].iter().all(|byte| *byte == 0));
     assert_eq!(pipeline.packets(), Some((6, 8)));
     // sums of the packets follow, and two of them fill the holes, or three
     let mut outcome = Outcome::NoCode;
@@ -188,7 +188,7 @@ fn frame_without_a_matrix_shows_no_code() -> Result<()> {
 
 #[test]
 fn frames_of_another_file_start_over() -> Result<()> {
-    // four packets of 5265 bytes, and three
+    // four packets of 5076 bytes, and three
     let (first, second) = (bytes(20_000, 5), bytes(15_000, 6));
     let mut pipeline = Pipeline::new();
     assert_eq!(pipeline.take(found(page_frame(&first, None)))?, Outcome::Ready);
@@ -209,7 +209,7 @@ fn frames_of_another_file_start_over() -> Result<()> {
     // nothing of the first file counts for it
     assert_eq!(
         (pipeline.packets(), pipeline.received()),
-        (Some((1, 3)), Some(5265))
+        (Some((1, 3)), Some(5076))
     );
     assert_eq!(
         pipeline.take(found(page_frame(&second, Some(0))))?,
@@ -233,7 +233,7 @@ fn empty_file_is_whole_at_its_start_screen() -> Result<()> {
 
 #[test]
 fn file_on_disk_is_held_against_its_checksums_and_a_misread_packet_is_left_out() -> Result<()> {
-    // eight packets of 5265 bytes, in eight sections of 5000
+    // eight packets of 5076 bytes, in eight sections of 5000
     let file = bytes(40_000, 16);
     let dir = scratch("checked");
     let (part, sums) = (dir.join("read.part"), dir.join("read.part.sums"));
@@ -287,7 +287,7 @@ fn file_on_disk_is_held_against_its_checksums_and_a_misread_packet_is_left_out()
 
 #[test]
 fn file_on_disk_is_gone_on_with_by_the_next_run() -> Result<()> {
-    // eight packets of 5265 bytes, in eight sections of 5000
+    // eight packets of 5076 bytes, in eight sections of 5000
     let file = bytes(40_000, 41);
     let dir = scratch("resumed");
     let (part, sums, index) = (
@@ -311,7 +311,7 @@ fn file_on_disk_is_gone_on_with_by_the_next_run() -> Result<()> {
     assert_eq!(pipeline.take_resumed(), None);
     assert_eq!(
         (pipeline.packets(), pipeline.received()),
-        (Some((4, 8)), Some(21_060))
+        (Some((4, 8)), Some(20_304))
     );
     // the run is stopped, and what it has stays where it is
     assert!(!index.exists());
@@ -325,14 +325,14 @@ fn file_on_disk_is_gone_on_with_by_the_next_run() -> Result<()> {
     let mut pipeline = run();
     assert_eq!((pipeline.packets(), pipeline.take_resumed()), (None, None));
     assert_eq!(pipeline.take(packet(4))?, Outcome::Packet { new: true });
-    assert_eq!(pipeline.take_resumed(), Some(21_060));
+    assert_eq!(pipeline.take_resumed(), Some(20_304));
     assert_eq!(pipeline.take_resumed(), None);
     assert_eq!(
         (pipeline.packets(), pipeline.sound()),
         (Some((5, 8)), Some((0, 8)))
     );
     // nothing was made anew, and what the first run read is not read again
-    assert_eq!(fs::read(&part)?[..4 * 5265], left[..]);
+    assert_eq!(fs::read(&part)?[..4 * 5076], left[..]);
     for frame in [0, 3, 8] {
         assert_eq!(pipeline.take(packet(frame))?, Outcome::Packet { new: false });
     }
@@ -348,7 +348,7 @@ fn file_on_disk_is_gone_on_with_by_the_next_run() -> Result<()> {
         }
     }
     assert_eq!(outcome, Outcome::Complete);
-    assert_eq!(pipeline.take_resumed(), Some(5 * 5265));
+    assert_eq!(pipeline.take_resumed(), Some(5 * 5076));
     assert_eq!(pipeline.take_notes(), []);
     assert_eq!(fs::read(&part)?, file);
     fs::remove_dir_all(&dir)?;
@@ -367,8 +367,8 @@ fn what_a_run_left_of_something_else_is_not_thrown_away() -> Result<()> {
     );
     let run = || Pipeline::storing(&part, &sums).resuming(&index);
     let packet = |frame: u64| found(page_frame(&file, Some(frame)));
-    // the page with a larger matrix: packets of 10077 bytes, of which the file is four
-    let encoder = Encoder::new(&file, origin.checksum, 10_077);
+    // the page with a larger matrix: packets of 11556 bytes, of which the file is four
+    let encoder = Encoder::new(&file, origin.checksum, 11_556);
     let larger = |sequence: u32| {
         found(Frame::Packet {
             origin,
@@ -390,7 +390,7 @@ fn what_a_run_left_of_something_else_is_not_thrown_away() -> Result<()> {
     let mut pipeline = run();
     let error = pipeline.take(larger(0)).unwrap_err().to_string();
     let told = format!(
-        "{} has what arrived of this file in packets of 5265 bytes, and the page shows packets of 10077 bytes \
+        "{} has what arrived of this file in packets of 5076 bytes, and the page shows packets of 11556 bytes \
          now. The file is gone on with by the matrix that it was begun with; for another one, {0} is to be \
          removed first, and the file begins anew",
         part.display()
@@ -434,7 +434,7 @@ fn what_a_run_left_of_something_else_is_not_thrown_away() -> Result<()> {
     assert_eq!(pipeline.take(larger(1))?, Outcome::Packet { new: true });
     assert_eq!(
         (pipeline.take_resumed(), pipeline.packets()),
-        (Some(10_077), Some((2, 4)))
+        (Some(11_556), Some((2, 4)))
     );
     // so does another file that comes on show
     assert_eq!(
@@ -716,7 +716,7 @@ fn program_reads_the_pictures_of_a_web_page() -> Result<()> {
     assert!(said.ends_with(&end), "{said}");
     let (sums, index) = (dir.join("read.bin.part.sums"), dir.join("read.bin.part.index"));
     assert!(part.exists() && sums.exists() && index.exists());
-    assert_eq!(fs::read(&part)?[..8 * 5265], file[..8 * 5265]);
+    assert_eq!(fs::read(&part)?[..8 * 5076], file[..8 * 5076]);
     // A run that sees nothing of the show leaves all of that as it is.
     let nothing = dir.join("nothing");
     fs::create_dir_all(&nothing)?;
@@ -747,7 +747,7 @@ fn program_reads_the_pictures_of_a_web_page() -> Result<()> {
     let said = String::from_utf8_lossy(&run.stderr);
     assert!(run.status.success() && run.stdout.is_empty(), "{said}");
     let begin = format!(
-        "frame 1: going on with {}, which has 42120 of the 50000 bytes\n",
+        "frame 1: going on with {}, which has 40608 of the 50000 bytes\n",
         part.display()
     );
     assert!(said.starts_with(&begin), "{said}");
@@ -793,9 +793,9 @@ fn page_that_goes_on_with_another_matrix_begins_the_file_anew() -> Result<()> {
         assert_eq!(outcome, Outcome::Packet { new: true });
     }
     assert_eq!(pipeline.packets(), Some((4, 8)));
-    // The page is written anew with a larger matrix: packets of 10077 bytes, of which the file is
+    // The page is written anew with a larger matrix: packets of 11556 bytes, of which the file is
     // four. What was held is of no use for them, and they are the file.
-    let encoder = Encoder::new(&file, origin.checksum, 10_077);
+    let encoder = Encoder::new(&file, origin.checksum, 11_556);
     let packet = |sequence: u32| Frame::Packet {
         origin,
         block: 0,
@@ -1321,7 +1321,7 @@ fn program_does_not_give_a_file_with_a_misread_packet_its_name() -> Result<()> {
     let whole = run(&dir)?;
     let said = String::from_utf8_lossy(&whole.stderr);
     assert!(
-        said.contains(", which has 26325 of the 50000 bytes\n") && said.contains("it is left as"),
+        said.contains(", which has 25380 of the 50000 bytes\n") && said.contains("it is left as"),
         "{said}"
     );
     assert!(!whole.status.success() && !output.exists() && part.exists() && !index.exists());
@@ -1336,10 +1336,10 @@ fn program_does_not_give_a_file_with_a_misread_packet_its_name() -> Result<()> {
 }
 
 #[test]
-fn share_that_is_put_right_is_of_all_the_bytes_that_a_frame_has() -> Result<()> {
-    // Sixteen tiles in a row are painted over, as by something that lies on the screen. They are 8 of
-    // the 4536 bytes of symbols that the frame has and 4 of its 2268 bytes of colours, and the check
-    // bytes put them right.
+fn share_that_is_put_right_is_of_all_the_tiles_that_a_frame_has() -> Result<()> {
+    // Sixteen tiles in a row are painted over, as by something that lies on the screen. They are 16 of
+    // the 9072 tiles that the frame has, and the check bits put them right. A tile of which nothing is
+    // seen is read as something, and one or the other as what it is.
     let file = bytes(20_000, 38);
     let frame = page_frame(&file, Some(0));
     let mut picture = tiles::render(GRID, &tiles::pack(GRID, &frame.encode(GRID.capacity())));
@@ -1354,7 +1354,11 @@ fn share_that_is_put_right_is_of_all_the_bytes_that_a_frame_has() -> Result<()> 
     let outcome = pipeline.process(&seen_from(GRID, &picture)?)?;
     assert_eq!(outcome, Outcome::Packet { new: true });
     let wrong = pipeline.last_survey().codes[0].wrong;
-    assert!((wrong - 12.0 / 6804.0).abs() < 1e-6, "{} bytes", wrong * 6804.0);
+    let tiles = wrong * 9072.0;
+    assert!(
+        (tiles - tiles.round()).abs() < 1e-3 && (12.0..=16.0).contains(&tiles.round()),
+        "{tiles} tiles"
+    );
     // and nothing in a frame that is as the page drew it
     show_page(&mut pipeline, &file, Some(1))?;
     assert_eq!(pipeline.last_survey().codes[0].wrong, 0.0);

@@ -2,7 +2,7 @@
 //!
 //! `qqcode-show` writes a web page that shows the file. The page cuts it into packets of which any that
 //! are enough make the file ([`fountain`]), puts each into a frame ([`packet`]) and shows that as a matrix
-//! of coloured tiles ([`tiles`]) with check bytes for what a camera misreads ([`rs`]). A file is named in
+//! of coloured tiles ([`tiles`]) with check bits for what a camera misreads ([`ldpc`]). A file is named in
 //! the frames by its length and its CRC-32 ([`crc`]).
 //!
 //! A file that the page shows may be far longer than the memory: [`stored`] puts it together on disk.
@@ -17,9 +17,9 @@ pub mod checks;
 pub mod crc;
 pub mod digest;
 pub mod fountain;
+pub mod ldpc;
 pub mod packet;
 pub mod reader;
-pub mod rs;
 pub mod scan;
 pub mod sight;
 pub mod stored;

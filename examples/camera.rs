@@ -333,8 +333,8 @@ fn shoot(
     Ok((seen, PITCH as f64 * fit, corners))
 }
 
-/// The tiles of a frame whose finder patterns are at `corners`, as the reader takes them to be.
-fn read_known(seen: &Mat, grid: Grid, corners: &[Point2f; 4]) -> Result<Vec<u8>> {
+/// The tiles of a frame whose finder patterns are at `corners`, as the reader is sure of them.
+fn read_known(seen: &Mat, grid: Grid, corners: &[Point2f; 4]) -> Result<Vec<tiles::Sure>> {
     let own = grid.anchors().map(|(x, y)| Point2f::new(x, y));
     let transform = imgproc::get_perspective_transform_def(
         &Vector::<Point2f>::from_slice(corners),
@@ -416,11 +416,11 @@ fn main() -> Result<()> {
                             *pixels.lock().unwrap_or_else(PoisonError::into_inner) = tile;
                             if cli.known {
                                 let begun = Instant::now();
-                                let taken = read_known(&seen, grid, &corners)?;
+                                let sure = read_known(&seen, grid, &corners)?;
                                 let reading = begun.elapsed();
-                                let unpacked = tiles::unpack(grid, &taken);
+                                let unpacked = tiles::unpack(grid, &sure);
                                 let mut tally = tally.lock().unwrap_or_else(PoisonError::into_inner);
-                                for (taken, shown) in taken.iter().zip(&values) {
+                                for (taken, shown) in tiles::likeliest(&sure).iter().zip(&values) {
                                     tally.symbols += usize::from(taken >> 2 != shown >> 2);
                                     tally.colours += usize::from(taken & 3 != shown & 3);
                                 }
@@ -432,7 +432,7 @@ fn main() -> Result<()> {
                                 });
                                 if let Some(unpacked) = read {
                                     tally.read += 1;
-                                    tally.wrong += unpacked.wrong as f32 / unpacked.bytes as f32;
+                                    tally.wrong += unpacked.wrong as f32 / unpacked.tiles as f32;
                                 }
                                 continue;
                             }

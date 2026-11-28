@@ -96,7 +96,7 @@ impl Frame {
     }
 
     /// The frame in these bytes, or `None` if they are not one: their check is wrong, which is to say that
-    /// tiles were misread beyond what the check bytes of the picture make up for and noticed.
+    /// tiles were misread beyond what the check bits of the picture make up for and noticed.
     pub fn parse(frame: &[u8]) -> Option<Self> {
         let (body, check) = frame.split_last_chunk::<4>()?;
         if body.len() < HEADER + 2 || body[..2] != MARK || u32::from_be_bytes(*check) != checksum(body) {

@@ -7,12 +7,14 @@
 //! tile shows its colour. In the four corners of the matrix sit the finder patterns of a QR code, by which
 //! the picture is found in a frame and laid flat.
 //!
-//! The bytes of a frame are spread over two planes, the symbols and the colours, each with Reed-Solomon
-//! check bytes of its own ([`crate::rs`]), more for the symbols, which a camera that is not sharp or that
-//! packs its frames gets wrong before it gets a colour wrong. The page computes
-//! all of this in JavaScript, so nothing here can change without it.
+//! The bytes of a frame are the data of one code word ([`crate::ldpc`]) whose bits are spread over the
+//! tiles in no order, four to the symbol of a tile and two to its colour, so that what a camera gets wrong
+//! in one place of the picture is shared out among all the checks. The page computes all of this in
+//! JavaScript, so nothing here can change without it.
 
-use crate::rs;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use crate::ldpc::{Code, Draw};
 
 /// Pixels along a side of a tile, and of a sub-cell of it.
 pub const TILE: usize = 8;
@@ -26,9 +28,14 @@ pub const ANCHOR: usize = 6;
 /// Pixels to a module of a finder pattern, which is seven of them wide.
 pub const MODULE: usize = 6;
 
-/// Check bytes to a code word of at most 255 bytes, in the plane of the symbols and in that of the colours.
-pub const SYMBOL_PARITY: usize = 64;
-pub const COLOUR_PARITY: usize = 40;
+/// Bits to a tile: four that say which symbol it is and two that say which colour.
+pub const BITS: usize = 6;
+
+/// How many of the bits of a frame are data: so many in so many. The others are check bits.
+pub const DATA: (usize, usize) = (3, 4);
+
+/// Rounds through the checks that the reader gives a frame.
+const ROUNDS: usize = 50;
 
 /// The colours of the tiles as red, green, blue: white, and white less one of the three.
 pub const COLOURS: [[u8; 3]; 4] = [[255, 255, 255], [0, 255, 255], [255, 0, 255], [255, 255, 0]];
@@ -120,91 +127,39 @@ impl Grid {
         [(near, near), (right, near), (right, low), (near, low)]
     }
 
-    fn planes(&self) -> (Plane, Plane) {
-        let symbols = Plane {
-            bytes: self.tiles() / 2,
-            parity: SYMBOL_PARITY,
-        };
-        let colours = Plane {
-            bytes: self.tiles() / 4,
-            parity: COLOUR_PARITY,
-        };
-        (symbols, colours)
-    }
-
-    /// How many bytes a frame holds once the check bytes are taken off.
+    /// How many bytes a frame holds once the check bits are taken off.
     pub fn capacity(&self) -> usize {
-        let (symbols, colours) = self.planes();
-        symbols.data() + colours.data()
+        self.tiles() * BITS * DATA.0 / DATA.1 / 8
     }
 }
 
-/// The bytes that the tiles spell in their symbols or in their colours, in code words that are interleaved:
-/// the first byte of every word, then the second of every word, and so on. Damage in one place of the
-/// picture is then shared out among all the words.
-struct Plane {
-    bytes: usize,
-    parity: usize,
+/// What the bits of a frame are made with: the code, and the place among the bits of the tiles that each
+/// bit of a code word has.
+struct Layout {
+    code: Code,
+    places: Vec<u32>,
 }
 
-impl Plane {
-    /// The lengths of the code words: as few words as hold the bytes, as equal as they come.
-    fn words(&self) -> Vec<usize> {
-        let count = self.bytes.div_ceil(255);
-        (0..count)
-            .map(|word| self.bytes / count + usize::from(word < self.bytes % count))
-            .collect()
-    }
+/// Where the sequence of numbers begins that the places of the bits are drawn from.
+const PLACES: u32 = 0x6c07_8965;
 
-    fn data(&self) -> usize {
-        self.bytes - self.words().len() * self.parity
+/// The layout of a matrix, which follows from how many tiles it has. It is made once.
+fn layout(grid: Grid) -> Arc<Layout> {
+    static MADE: Mutex<Vec<(usize, Arc<Layout>)>> = Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, layout)) = made.iter().find(|(tiles, _)| *tiles == grid.tiles()) {
+        return layout.clone();
     }
-
-    fn encode(&self, data: &[u8]) -> Vec<u8> {
-        assert_eq!(data.len(), self.data());
-        let mut rest = data;
-        let mut words = Vec::new();
-        for length in self.words() {
-            let (word, tail) = rest.split_at(length - self.parity);
-            let mut word = word.to_vec();
-            word.extend(rs::encode(&word, self.parity));
-            words.push(word);
-            rest = tail;
-        }
-        let mut plane = Vec::with_capacity(self.bytes);
-        for place in 0..words.first().map_or(0, Vec::len) {
-            plane.extend(words.iter().filter_map(|word| word.get(place)));
-        }
-        plane
-    }
-
-    /// The data in a plane as it was read, and how many of its bytes had to be put right; `None` if a
-    /// word has more wrong bytes than its check bytes make up for.
-    fn decode(&self, plane: &[u8]) -> Option<(Vec<u8>, usize)> {
-        let lengths = self.words();
-        let mut words = lengths
-            .iter()
-            .map(|length| Vec::with_capacity(*length))
-            .collect::<Vec<_>>();
-        let mut bytes = plane.iter();
-        for place in 0..lengths.first().copied().unwrap_or(0) {
-            for (word, length) in words.iter_mut().zip(&lengths) {
-                if place < *length {
-                    word.push(*bytes.next()?);
-                }
-            }
-        }
-        let mut data = Vec::with_capacity(self.data());
-        let mut wrong = 0;
-        for word in &mut words {
-            wrong += rs::correct(word, self.parity)?;
-            data.extend(&word[..word.len() - self.parity]);
-        }
-        Some((data, wrong))
-    }
+    let bits = grid.tiles() * BITS;
+    let layout = Arc::new(Layout {
+        code: Code::new(bits, 8 * grid.capacity()),
+        places: Draw(PLACES).order(bits),
+    });
+    made.push((grid.tiles(), layout.clone()));
+    layout
 }
 
-/// The numbers that the planes are mixed with, so that the tiles of a frame look alike in no two places
+/// The numbers that the tiles are mixed with, so that the tiles of a frame look alike in no two places
 /// whatever its bytes are: this many of a sequence that goes on from `state`.
 fn mix(bytes: &mut [u8], state: &mut u32) {
     for byte in bytes {
@@ -220,23 +175,48 @@ const MIX: u32 = 0x9e37_79b9;
 /// The tiles of the frame that holds `payload`, which is as long as the grid's capacity: a value from 0 to
 /// 63 for every cell, its symbol times four plus its colour.
 pub fn pack(grid: Grid, payload: &[u8]) -> Vec<u8> {
-    let (symbols, colours) = grid.planes();
     assert_eq!(payload.len(), grid.capacity(), "a payload that fills the frame");
-    let (first, second) = payload.split_at(symbols.data());
-    let (mut symbols, mut colours) = (symbols.encode(first), colours.encode(second));
-    let mut state = MIX;
-    mix(&mut symbols, &mut state);
-    mix(&mut colours, &mut state);
-    (0..grid.tiles())
+    let layout = layout(grid);
+    let data = payload
+        .iter()
+        .flat_map(|byte| (0..8).rev().map(move |bit| byte >> bit & 1))
+        .collect::<Vec<_>>();
+    let mut tiles = vec![0u8; grid.tiles()];
+    for (bit, place) in layout.code.encode(&data).iter().zip(&layout.places) {
+        let place = *place as usize;
+        tiles[place / BITS] |= bit << (BITS - 1 - place % BITS);
+    }
+    mix(&mut tiles, &mut { MIX });
+    tiles.iter_mut().for_each(|tile| *tile &= 63);
+    tiles
+}
+
+/// How sure a reader is of the six bits of a tile, the first of its symbol first: above zero for a 0 and
+/// below it for a 1, the further from zero the surer.
+pub type Sure = [f32; BITS];
+
+/// A reader that has no doubt of these tiles.
+pub fn certain(tiles: &[u8]) -> Vec<Sure> {
+    tiles
+        .iter()
         .map(|tile| {
-            // what is left over of the cells when the bytes are full stays 0
-            let symbol = symbols
-                .get(tile / 2)
-                .map_or(0, |byte| (byte >> (4 - 4 * (tile % 2))) & 15);
-            let colour = colours
-                .get(tile / 4)
-                .map_or(0, |byte| (byte >> (6 - 2 * (tile % 4))) & 3);
-            symbol << 2 | colour
+            std::array::from_fn(|bit| {
+                if tile >> (BITS - 1 - bit) & 1 == 1 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            })
+        })
+        .collect()
+}
+
+/// The tiles as a reader takes them to be that has to say one thing of each.
+pub fn likeliest(sure: &[Sure]) -> Vec<u8> {
+    sure.iter()
+        .map(|tile| {
+            tile.iter()
+                .fold(0, |value, bit| value << 1 | u8::from(*bit < 0.0))
         })
         .collect()
 }
@@ -245,38 +225,48 @@ pub fn pack(grid: Grid, payload: &[u8]) -> Vec<u8> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unpacked {
     pub payload: Vec<u8>,
-    /// How many bytes of the two planes were misread and put right
+    /// How many tiles were misread and put right
     pub wrong: usize,
-    /// How many bytes the two planes have
-    pub bytes: usize,
+    /// How many tiles the frame has
+    pub tiles: usize,
 }
 
 /// The payload of the frame with these tiles, or `None` if too many of them are misread.
-pub fn unpack(grid: Grid, tiles: &[u8]) -> Option<Unpacked> {
-    if tiles.len() != grid.tiles() {
+pub fn unpack(grid: Grid, sure: &[Sure]) -> Option<Unpacked> {
+    if sure.len() != grid.tiles() {
         return None;
     }
-    let (symbols, colours) = grid.planes();
-    let mut symbol_bytes = vec![0u8; symbols.bytes];
-    let mut colour_bytes = vec![0u8; colours.bytes];
-    for (tile, value) in tiles.iter().enumerate() {
-        if let Some(byte) = symbol_bytes.get_mut(tile / 2) {
-            *byte |= (value >> 2 & 15) << (4 - 4 * (tile % 2));
-        }
-        if let Some(byte) = colour_bytes.get_mut(tile / 4) {
-            *byte |= (value & 3) << (6 - 2 * (tile % 4));
-        }
+    let layout = layout(grid);
+    let mut mixed = vec![0u8; grid.tiles()];
+    mix(&mut mixed, &mut { MIX });
+    // the bits of the code word as they are before they are mixed: a bit that the mixing turns over is as
+    // sure as it was, of the other value
+    let seen = layout
+        .places
+        .iter()
+        .map(|place| {
+            let (tile, bit) = (*place as usize / BITS, *place as usize % BITS);
+            let value = sure[tile][bit];
+            if mixed[tile] >> (BITS - 1 - bit) & 1 == 1 {
+                -value
+            } else {
+                value
+            }
+        })
+        .collect::<Vec<_>>();
+    let word = layout.code.decode(&seen, ROUNDS)?;
+    let payload = word[..layout.code.data()]
+        .chunks_exact(8)
+        .map(|byte| byte.iter().fold(0, |value, bit| value << 1 | bit))
+        .collect();
+    let mut misread = vec![false; grid.tiles()];
+    for ((bit, seen), place) in word.iter().zip(&seen).zip(&layout.places) {
+        misread[*place as usize / BITS] |= (*bit == 1) != (*seen < 0.0);
     }
-    let mut state = MIX;
-    mix(&mut symbol_bytes, &mut state);
-    mix(&mut colour_bytes, &mut state);
-    let (mut payload, wrong_symbols) = symbols.decode(&symbol_bytes)?;
-    let (rest, wrong_colours) = colours.decode(&colour_bytes)?;
-    payload.extend(rest);
     Some(Unpacked {
         payload,
-        wrong: wrong_symbols + wrong_colours,
-        bytes: symbols.bytes + colours.bytes,
+        wrong: misread.iter().filter(|misread| **misread).count(),
+        tiles: grid.tiles(),
     })
 }
 
@@ -377,28 +367,37 @@ mod tests {
     }
 
     #[test]
-    fn frame_holds_what_the_check_bytes_leave() {
-        // 17280 tiles: 8640 bytes of symbols in 34 words with 64 check bytes each, 4320 bytes of colours in
-        // 17 words with 40
-        assert_eq!(WIDE.capacity(), 8640 - 34 * 64 + 4320 - 17 * 40);
-        assert_eq!(WIDE.capacity(), 10104);
+    fn frame_holds_what_the_check_bits_leave() {
+        // 17280 tiles of 6 bits, three in four of them data
+        assert_eq!(WIDE.capacity(), 17280 * 6 * 3 / 4 / 8);
+        assert_eq!(WIDE.capacity(), 9720);
         let small = Grid::new(Shape::Square, 4);
-        assert_eq!(small.capacity(), 576 - 3 * 64 + 288 - 2 * 40);
+        assert_eq!(small.capacity(), 648);
+        // a matrix whose bits do not come out in whole bytes: the bytes that are whole are the data, and
+        // what is left over are check bits
+        let odd = Grid::new(Shape::Classic, 7);
+        assert_eq!((odd.tiles(), odd.capacity()), (5148, 2895));
         for shape in Shape::ALL {
             for scale in SCALES {
                 let grid = Grid::new(shape, scale);
-                let (symbols, colours) = grid.planes();
-                for plane in [symbols, colours] {
-                    let words = plane.words();
-                    assert_eq!(words.iter().sum::<usize>(), plane.bytes);
-                    assert!(
-                        words
-                            .iter()
-                            .all(|length| (plane.parity + 1..=255).contains(length))
-                    );
-                }
+                let (bits, data) = (grid.tiles() * BITS, 8 * grid.capacity());
+                assert!(data * DATA.1 <= bits * DATA.0 && bits * DATA.0 < (data + 8) * DATA.1);
             }
         }
+    }
+
+    #[test]
+    fn bits_of_a_frame_each_have_a_place_of_their_own() {
+        let grid = Grid::new(Shape::Square, 4);
+        let layout = layout(grid);
+        assert_eq!((layout.code.bits(), layout.code.data()), (6912, 5184));
+        let mut places = layout.places.clone();
+        places.sort_unstable();
+        assert!(places.iter().copied().eq(0..6912));
+        // in no order: the first bits of the code word are not the first tiles
+        assert!(layout.places[..60].iter().any(|place| *place >= 60));
+        // and the layout is made once
+        assert!(Arc::ptr_eq(&layout, &super::layout(grid)));
     }
 
     #[test]
@@ -434,11 +433,12 @@ mod tests {
             let tiles = pack(grid, &payload);
             assert_eq!(tiles.len(), grid.tiles());
             assert!(tiles.iter().all(|tile| *tile < 64));
-            let unpacked = unpack(grid, &tiles).unwrap();
-            assert_eq!((unpacked.payload, unpacked.wrong), (payload, 0));
-            assert_eq!(unpacked.bytes, grid.tiles() / 2 + grid.tiles() / 4);
+            assert_eq!(likeliest(&certain(&tiles)), tiles);
+            let unpacked = unpack(grid, &certain(&tiles)).unwrap();
+            assert!(unpacked.payload == payload);
+            assert_eq!((unpacked.wrong, unpacked.tiles), (0, grid.tiles()));
         }
-        assert_eq!(unpack(WIDE, &[0; 100]), None);
+        assert!(unpack(WIDE, &certain(&[0; 100])).is_none());
     }
 
     #[test]
@@ -459,26 +459,37 @@ mod tests {
     fn misread_tiles_are_put_right_up_to_a_point() {
         let payload = bytes(WIDE.capacity(), 9);
         let tiles = pack(WIDE, &payload);
-        // a patch of 30 by 30 tiles is read as anything, as under a reflection
+        // a patch of 20 by 20 tiles is read as anything and as surely as the others, as between two frames
         let mut damaged = tiles.clone();
         for ((column, row), tile) in WIDE.cells().zip(&mut damaged) {
-            if (60..90).contains(&column) && (40..70).contains(&row) {
+            if (60..80).contains(&column) && (40..60).contains(&row) {
                 *tile = (*tile + 21) % 64;
             }
         }
-        let unpacked = unpack(WIDE, &damaged).unwrap();
-        assert_eq!(unpacked.payload, payload);
-        assert!((600..=720).contains(&unpacked.wrong), "{}", unpacked.wrong);
-        // one tile in sixty all over the picture, each in a byte of colours of its own
-        let mut speckled = tiles.clone();
-        for tile in speckled.iter_mut().step_by(60) {
-            *tile ^= 0b10_1101;
+        let unpacked = unpack(WIDE, &certain(&damaged)).unwrap();
+        assert!(unpacked.payload == payload);
+        assert_eq!(unpacked.wrong, 400);
+        // a patch four times as large that the reader makes nothing of, as under a reflection: nothing is
+        // known of its bits
+        let mut blind = certain(&tiles);
+        for ((column, row), tile) in WIDE.cells().zip(&mut blind) {
+            if (50..90).contains(&column) && (30..70).contains(&row) {
+                *tile = [0.0; BITS];
+            }
         }
-        assert_eq!(unpack(WIDE, &speckled).unwrap().payload, payload);
+        assert!(unpack(WIDE, &blind).unwrap().payload == payload);
+        // one tile in ten all over the picture is another, each less sure than the tiles that are right
+        let mut doubtful = certain(&tiles);
+        for tile in doubtful.iter_mut().step_by(10) {
+            *tile = tile.map(|bit| -0.25 * bit);
+        }
+        let unpacked = unpack(WIDE, &doubtful).unwrap();
+        assert!(unpacked.payload == payload);
+        assert_eq!((unpacked.wrong, unpacked.tiles), (1728, 17280));
         // half the picture is beyond it
         let mut lost = tiles;
         lost[..8000].fill(0);
-        assert_eq!(unpack(WIDE, &lost), None);
+        assert!(unpack(WIDE, &certain(&lost)).is_none());
     }
 
     #[test]
@@ -529,24 +540,11 @@ mod tests {
         let grid = Grid::new(Shape::Square, 4);
         let payload = (0..grid.capacity()).map(|at| at as u8).collect::<Vec<_>>();
         let mut tiles = pack(grid, &payload);
-        assert_eq!(
-            unpack(grid, &tiles).map(|unpacked| unpacked.payload),
-            Some(payload)
-        );
+        assert!(unpack(grid, &certain(&tiles)).map(|unpacked| unpacked.payload) == Some(payload));
         // read with the wrong guess of what the matrix is: a tile too many, and one too few
         tiles.push(0);
-        assert_eq!(unpack(grid, &tiles), None);
+        assert!(unpack(grid, &certain(&tiles)).is_none());
         tiles.truncate(tiles.len() - 2);
-        assert_eq!(unpack(grid, &tiles), None);
-    }
-
-    #[test]
-    fn planes_that_are_a_whole_number_of_words_have_no_word_more() {
-        // 256 by 144 tiles less the corners: 18360 bytes of symbols, which are 72 words of 255 bytes, and
-        // 9180 bytes of colours, which are 36
-        let grid = Grid::new(Shape::Wide, 16);
-        let (symbols, colours) = grid.planes();
-        assert_eq!((symbols.words(), colours.words()), (vec![255; 72], vec![255; 36]));
-        assert_eq!(grid.capacity(), 18360 - 72 * 64 + 9180 - 36 * 40);
+        assert!(unpack(grid, &certain(&tiles)).is_none());
     }
 }
