@@ -5,6 +5,11 @@
 //! profile and changes with every toolchain update, and recompiling OpenCV takes minutes. CMake keeps a
 //! tree incremental, and a stamp file lets an up-to-date tree skip CMake entirely.
 //!
+//! The stamp records what the tree was configured from: the revision of the checkout, the CMake command
+//! line and the environment variables below. When any of that differs, CMake starts from an empty cache,
+//! because a cache keeps the generator, the compiler, the FFmpeg that was found and every option of an
+//! earlier command line, whatever the new one says.
+//!
 //! Environment variables (all optional):
 //! * `CMAKE`: cmake executable, default `cmake` from `PATH`
 //! * `CMAKE_PREFIX_PATH`: extra prefixes to search, e.g. for an FFmpeg that is not installed system-wide
@@ -19,7 +24,8 @@ use std::process::{Command, Stdio};
 /// OpenCV modules the application uses. `BUILD_LIST` adds whatever these depend on.
 const MODULES: &[&str] = &["core", "imgproc", "imgcodecs", "videoio"];
 
-/// Variables that change the result of the build; cargo re-runs this script when one of them changes.
+/// Variables that change the result of the build; cargo re-runs this script when one of them changes, and
+/// their values are in the stamp, so that the re-run configures and builds again.
 const ENV_VARS: &[&str] = &[
     "CMAKE",
     "QQCODE_OPENCV_CMAKE_ARGS",
@@ -62,7 +68,7 @@ fn main() {
     let revision = source_revision(&opencv_src);
 
     let args = cmake_args(&opencv_src, &prefix);
-    let wanted_stamp = format!("{revision}\n{}\n", args.join("\n"));
+    let wanted_stamp = stamp_text(&revision, &args);
     let up_to_date = fs::read_to_string(&stamp).is_ok_and(|have| have == wanted_stamp);
     if !up_to_date {
         // a half-finished build must not look current to the next run
@@ -105,6 +111,17 @@ fn source_revision(dir: &Path) -> String {
         println!("cargo::rerun-if-changed={git_dir}/HEAD");
     }
     git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown revision".to_string())
+}
+
+/// What the build tree is configured from: the revision of the checkout, the CMake command line, and the
+/// variables that CMake reads from the environment by itself, which the command line doesn't show.
+fn stamp_text(revision: &str, args: &[String]) -> String {
+    let mut stamp = format!("{revision}\n{}\n", args.join("\n"));
+    for var in ENV_VARS {
+        let value = env::var_os(var).unwrap_or_default();
+        stamp.push_str(&format!("{var}={}\n", value.to_string_lossy()));
+    }
+    stamp
 }
 
 /// The CMake command line.
@@ -171,6 +188,12 @@ fn cmake_args(opencv_src: &Path, prefix: &Path) -> Vec<String> {
 
 fn build(build_dir: &Path, args: &[String]) {
     fs::create_dir_all(build_dir).expect("can't create the OpenCV build directory");
+    // What the tree was configured from has changed, or it was never finished. CMake refuses another
+    // generator for a tree that has a cache, and keeps the compiler, the libraries it found and the options
+    // of the command line before this one. So the cache goes, which is what `cmake --fresh` does, an option
+    // that CMake has from 3.24 on only. The object files stay.
+    let _ = fs::remove_file(build_dir.join("CMakeCache.txt"));
+    let _ = fs::remove_dir_all(build_dir.join("CMakeFiles"));
     let cmake = env::var_os("CMAKE").unwrap_or_else(|| "cmake".into());
     let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "1".to_string());
 
