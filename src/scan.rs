@@ -119,23 +119,9 @@ fn codes(
     if sighted.lock.is_none() && hint.is_none() {
         return Ok((Vec::new(), None));
     }
-    let longest = sighted
-        .lock
-        .map_or(0, |lock| lock.grid.columns.max(lock.grid.rows));
-    let outline = sighted.outline;
-    let side = (0..4)
-        .map(|corner| {
-            let (from, to) = (outline[corner], outline[(corner + 1) % 4]);
-            (to.x - from.x).hypot(to.y - from.y)
-        })
-        .fold(0.0, f32::max);
     let found = Found {
-        outline,
-        modules: if longest > 0 {
-            longest
-        } else {
-            (side / sighted.tile_size).round().max(1.0) as usize
-        },
+        outline: sighted.outline,
+        modules: sighted.tiles,
         frame: sighted.frame,
         wrong: sighted.wrong,
     };

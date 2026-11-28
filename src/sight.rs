@@ -44,8 +44,9 @@ pub struct Sighted {
     /// What the frame says, if its tiles could be read
     pub frame: Option<Frame>,
     pub lock: Option<Lock>,
-    /// Pixels of the frame from one tile to the next
-    pub tile_size: f32,
+    /// Tiles along the longer side of the matrix; of a matrix that is not read, going by the size of its
+    /// finder patterns
+    pub tiles: usize,
     /// The share of the bytes of a frame that were misread and put right
     pub wrong: f32,
 }
@@ -155,27 +156,23 @@ pub fn read(frame: &Mat, finders: &[Finder], hint: Option<Lock>) -> Result<Optio
             outline: reading.outline,
             frame: Some(reading.frame),
             lock: Some(lock),
-            tile_size: tile_size(&reading.outline, lock.grid),
+            tiles: lock.grid.columns.max(lock.grid.rows),
             wrong: reading.wrong,
         }));
     }
     // a matrix all the same, as far as its corners say: one that can't be read
     let pattern = corners.iter().map(|finder| finder.size).sum::<f32>() / 4.0;
+    let pitch = pattern / (7 * MODULE) as f32 * PITCH as f32;
+    let longest = (0..4)
+        .map(|corner| distance(&corners[corner], &corners[(corner + 1) % 4]))
+        .fold(0.0, f32::max);
     Ok(Some(Sighted {
         outline: seen,
         frame: None,
         lock: None,
-        tile_size: pattern / (7 * MODULE) as f32 * PITCH as f32,
+        tiles: (longest / pitch).round().max(1.0) as usize,
         wrong: 0.0,
     }))
-}
-
-fn tile_size(outline: &[Point2f; 4], grid: Grid) -> f32 {
-    let side =
-        |from: usize, to: usize| (outline[to].x - outline[from].x).hypot(outline[to].y - outline[from].y);
-    let across = side(0, 1).max(side(3, 2)) / grid.columns as f32;
-    let down = side(0, 3).max(side(1, 2)) / grid.rows as f32;
-    across.max(down)
 }
 
 struct Reading {

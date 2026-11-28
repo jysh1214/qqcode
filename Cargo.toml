@@ -32,10 +32,11 @@ opencv = { path = "third_party/opencv-rust", default-features = false, features 
 ] }
 opencv-vendored = { path = "crates/opencv-vendored" }
 # finds the finder patterns in a frame, which the matrix has in its corners and which are those of a QR
-# code: of the many kinds of codes it reads, the QR reader alone
+# code: of the many kinds of codes it reads, the QR reader alone, and none of the character sets that the
+# text of a code may be in, as no text is read
 rxing = { version = "0.9", default-features = false, features = [
     "decoders",
-    "encoding_rs",
+    "no_character_set_support",
     "qrcode",
 ] }
 # the MD5 and the SHA-256 that both programs print of the file when they end

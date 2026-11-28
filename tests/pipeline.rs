@@ -59,33 +59,7 @@ fn page_frame(file: &[u8], frame: Option<u64>) -> Frame {
 /// A camera frame that shows the page with `frame` on it: the matrix on a light page, somewhat smaller
 /// than it is, a little turned and out of focus.
 fn page_seen(frame: &Frame) -> Result<Mat> {
-    let picture = tiles::render(GRID, &tiles::pack(GRID, &frame.encode(GRID.capacity())));
-    let size = Size::new(GRID.width() as i32, GRID.height() as i32);
-    let mut matrix = Mat::new_size_with_default(size, CV_8UC3, Scalar::all(0.0))?;
-    for (to, from) in matrix
-        .data_bytes_mut()?
-        .chunks_exact_mut(3)
-        .zip(picture.chunks_exact(3))
-    {
-        to.copy_from_slice(&[from[2], from[1], from[0]]);
-    }
-    let middle = Point2f::new(size.width as f32 / 2.0, size.height as f32 / 2.0);
-    let mut transform = imgproc::get_rotation_matrix_2d(middle, 1.5, 0.9)?;
-    *transform.at_2d_mut::<f64>(0, 2)? += 960.0 - middle.x as f64;
-    *transform.at_2d_mut::<f64>(1, 2)? += 540.0 - middle.y as f64;
-    let mut seen = Mat::default();
-    imgproc::warp_affine(
-        &matrix,
-        &mut seen,
-        &transform,
-        Size::new(1920, 1080),
-        imgproc::INTER_LINEAR,
-        core::BORDER_CONSTANT,
-        Scalar::all(240.0),
-    )?;
-    let mut blurred = Mat::default();
-    imgproc::gaussian_blur_def(&seen, &mut blurred, Size::new(0, 0), 1.0)?;
-    Ok(blurred)
+    seen_in(GRID, frame)
 }
 
 /// Shows the reader a frame of the page of `file`.

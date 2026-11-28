@@ -304,7 +304,7 @@ fn main() -> Result<()> {
         let (written, to, digests) = match store {
             Some(store) => {
                 let to = store.path.display().to_string();
-                let (written, digests) = store.finish(origin, file, sha256.as_deref())?;
+                let (written, digests) = store.finish(origin, sha256.as_deref())?;
                 (written, to, digests)
             }
             None => {
@@ -390,59 +390,44 @@ impl Store {
         }
     }
 
-    /// Ends the writing of a file that is whole. `kept` is the file if it was kept in memory, which is
-    /// checked already. A file that was put together on disk is read once more, for its checksum and its
-    /// length, which have to be those of `origin`, and for its SHA-256, which has to be `sha256` if the
-    /// checksums of the file are at hand. Returns how many bytes the file has, and its SHA-256 and MD5.
-    fn finish(
-        self,
-        origin: Origin,
-        kept: Option<Vec<u8>>,
-        sha256: Option<&str>,
-    ) -> Result<(u64, (String, String))> {
+    /// Ends the writing of a file that is whole. It is read once more, for its checksum and its length,
+    /// which have to be those of `origin`, and for its SHA-256, which has to be `sha256` if the checksums
+    /// of the file are at hand. Returns how many bytes the file has, and its SHA-256 and MD5.
+    fn finish(self, origin: Origin, sha256: Option<&str>) -> Result<(u64, (String, String))> {
         let part = self.part.display().to_string();
-        let digests = match kept {
-            Some(file) => {
-                fs::write(&self.part, &file).with_context(|| format!("can't write {part}"))?;
-                (digest::sha256(&file), digest::md5(&file))
+        let file = File::open(&self.part).with_context(|| format!("can't read {part}"))?;
+        let (mut checksum, mut digests, mut length) = (Checksum::new(), Digests::default(), 0u64);
+        let mut piece = vec![0u8; 1 << 20];
+        loop {
+            let read = file
+                .read_at(&mut piece, length)
+                .with_context(|| format!("can't read {part}"))?;
+            if read == 0 {
+                break;
             }
-            None => {
-                let file = File::open(&self.part).with_context(|| format!("can't read {part}"))?;
-                let (mut checksum, mut digests, mut length) = (Checksum::new(), Digests::default(), 0u64);
-                let mut piece = vec![0u8; 1 << 20];
-                loop {
-                    let read = file
-                        .read_at(&mut piece, length)
-                        .with_context(|| format!("can't read {part}"))?;
-                    if read == 0 {
-                        break;
-                    }
-                    checksum.update(&piece[..read]);
-                    digests.update(&piece[..read]);
-                    length += read as u64;
-                }
-                let digests = digests.finish();
-                // nothing but this stands between a block that was solved wrongly and the file
-                let named = length == origin.length && checksum.finish() == origin.checksum;
-                let hashed = sha256.is_none_or(|sha256| sha256 == digests.0);
-                if !(named && hashed) {
-                    // A file that is whole and wrong is not gone on with, as nothing says which of its
-                    // packets to read again: without its index the next run begins it anew.
-                    let _ = fs::remove_file(&self.index);
-                }
-                ensure!(
-                    named,
-                    "the file that was put together has not the length and the checksum that its frames name: \
-                     it is left as {part}"
-                );
-                ensure!(
-                    hashed,
-                    "the file that was put together has not the SHA-256 that its checksums name: it is left \
-                     as {part}"
-                );
-                digests
-            }
-        };
+            checksum.update(&piece[..read]);
+            digests.update(&piece[..read]);
+            length += read as u64;
+        }
+        let digests = digests.finish();
+        // nothing but this stands between a block that was solved wrongly and the file
+        let named = length == origin.length && checksum.finish() == origin.checksum;
+        let hashed = sha256.is_none_or(|sha256| sha256 == digests.0);
+        if !(named && hashed) {
+            // A file that is whole and wrong is not gone on with, as nothing says which of its
+            // packets to read again: without its index the next run begins it anew.
+            let _ = fs::remove_file(&self.index);
+        }
+        ensure!(
+            named,
+            "the file that was put together has not the length and the checksum that its frames name: it \
+             is left as {part}"
+        );
+        ensure!(
+            hashed,
+            "the file that was put together has not the SHA-256 that its checksums name: it is left as \
+             {part}"
+        );
         fs::rename(&self.part, &self.path)
             .with_context(|| format!("can't move {part} to {}", self.path.display()))?;
         let _ = fs::remove_file(&self.sums);
