@@ -828,6 +828,10 @@ fn frame_size(camera: &impl Camera) -> Result<Size> {
 /// Motion JPEG as OpenCV and V4L2 name pixel formats, by the four characters `MJPG`.
 const MOTION_JPEG: f64 = u32::from_le_bytes(*b"MJPG") as f64;
 
+/// Frames a second to ask a camera for, of which it gives as many as it has: what OpenCV asks for when it
+/// opens one.
+const CAMERA_RATE: f64 = 30.0;
+
 /// Asks a camera for frames of `wanted` size. Returns the size it delivers from then on, which is the
 /// nearest it has if it doesn't have that one.
 ///
@@ -837,11 +841,17 @@ const MOTION_JPEG: f64 = u32::from_le_bytes(*b"MJPG") as f64;
 /// the uncompressed format it prefers, so the question is repeated for Motion JPEG, and that is taken
 /// where it comes nearer to the size, or as near and brings more frames a second: a page that shows fifteen
 /// frames a second is not read at five, and it is read from a compressed frame as well as from any other.
+///
+/// The frame rate is asked for anew with every size. OpenCV does not: whenever the size or the format
+/// changes, it asks the camera for the rate that the camera had before, so that one which has been at a
+/// size that it has few frames a second of stays that slow at a size that it has thirty of.
 fn request_size(camera: &mut impl Camera, wanted: Size) -> Result<Size> {
     fn ask(camera: &mut impl Camera, wanted: Size) -> Result<Size> {
         // the camera changes its size when the second of the two arrives
         camera.set_property(videoio::CAP_PROP_FRAME_WIDTH, wanted.width as f64)?;
         camera.set_property(videoio::CAP_PROP_FRAME_HEIGHT, wanted.height as f64)?;
+        // a camera that does not take a rate keeps the one it has
+        camera.set_property(videoio::CAP_PROP_FPS, CAMERA_RATE)?;
         frame_size(camera)
     }
 
@@ -879,17 +889,21 @@ mod tests {
     const RATE: i32 = videoio::CAP_PROP_FPS;
     const YUYV: f64 = u32::from_le_bytes(*b"YUYV") as f64;
 
-    /// A size that a camera has in a pixel format: width, height, frames a second.
+    /// A size that a camera has in a pixel format: width, height, and the most frames a second it has of it.
     type Mode = (i32, i32, f64);
 
     /// A camera that has some sizes in each of its pixel formats and settles on the nearest one to what it
-    /// is asked for, the way a V4L2 camera behaves behind OpenCV.
+    /// is asked for, the way a V4L2 camera behaves behind OpenCV. So does its frame rate: OpenCV begins by
+    /// asking for thirty frames a second, and with every other size or format asks for as many as the
+    /// camera had until then, of which the camera gives no more than it has.
     struct Fake {
         formats: Vec<(f64, Vec<Mode>)>,
         format: f64,
         mode: Mode,
         /// Width and height asked for and not yet in effect, 0 if not asked for
         asked: (i32, i32),
+        /// Frames a second that the camera gives
+        rate: f64,
     }
 
     impl Fake {
@@ -903,6 +917,7 @@ mod tests {
                 format: formats[0].0,
                 mode: (0, 0, 0.0),
                 asked: (0, 0),
+                rate: 30.0,
             };
             fake.settle((640, 480));
             fake
@@ -917,6 +932,7 @@ mod tests {
                 .1;
             let off = |mode: &&Mode| (mode.0 - wanted.0).abs() + (mode.1 - wanted.1).abs();
             self.mode = *modes.iter().min_by_key(off).unwrap();
+            self.rate = self.rate.min(self.mode.2);
         }
     }
 
@@ -926,7 +942,7 @@ mod tests {
                 WIDTH => self.mode.0 as f64,
                 HEIGHT => self.mode.1 as f64,
                 FORMAT => self.format,
-                RATE => self.mode.2,
+                RATE => self.rate,
                 _ => 0.0,
             })
         }
@@ -942,6 +958,7 @@ mod tests {
                     self.format = value;
                     self.settle((self.mode.0, self.mode.1));
                 }
+                RATE => self.rate = value.min(self.mode.2),
                 _ => return Ok(false),
             }
             if self.asked.0 > 0 && self.asked.1 > 0 {
@@ -974,7 +991,35 @@ mod tests {
     fn size_that_is_faster_compressed_switches_to_motion_jpeg() -> Result<()> {
         let mut camera = webcam();
         assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, CAMERA_SIZE);
-        assert_eq!((camera.format, camera.mode.2), (MOTION_JPEG, 30.0));
+        assert_eq!((camera.format, camera.rate), (MOTION_JPEG, 30.0));
+        Ok(())
+    }
+
+    #[test]
+    fn rate_is_that_of_the_size_the_camera_ends_up_with() -> Result<()> {
+        // A webcam with frames of four by three: uncompressed it has seven and a half of its largest a
+        // second, as Motion JPEG thirty. It was slowed down on the way there, and is not left slow.
+        let mut camera = Fake::new(&[
+            (YUYV, &[(640, 480, 30.0), (1280, 960, 7.5)]),
+            (MOTION_JPEG, &[(640, 480, 30.0), (1280, 960, 30.0)]),
+        ]);
+        assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, Size::new(1280, 960));
+        assert_eq!((camera.format, camera.rate), (MOTION_JPEG, 30.0));
+        // nor at a smaller size that it is asked for after a large one
+        camera.set_property(FORMAT, YUYV)?;
+        assert_eq!(
+            request_size(&mut camera, Size::new(1280, 960))?,
+            Size::new(1280, 960)
+        );
+        assert_eq!(
+            request_size(&mut camera, Size::new(640, 480))?,
+            Size::new(640, 480)
+        );
+        assert_eq!(camera.rate, 30.0);
+        // a camera that has no more of a size gives what it has
+        let mut slow = Fake::new(&[(MOTION_JPEG, &[(640, 480, 30.0), (1920, 1080, 15.0)])]);
+        assert_eq!(request_size(&mut slow, CAMERA_SIZE)?, CAMERA_SIZE);
+        assert_eq!(slow.rate, 15.0);
         Ok(())
     }
 
@@ -1029,7 +1074,7 @@ mod tests {
             (MOTION_JPEG, &[(640, 480, 30.0)]),
         ]);
         assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, Size::new(1280, 720));
-        assert_eq!((camera.format, camera.mode.2), (YUYV, 10.0));
+        assert_eq!((camera.format, camera.rate), (YUYV, 10.0));
         Ok(())
     }
 
