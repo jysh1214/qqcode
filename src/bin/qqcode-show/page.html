@@ -366,6 +366,12 @@ async function fileChecksum(file, progress) {
 }
 
 // ---- the screen
+// The frames a second that + and - go through. A page may be written for a pace that is none of them, and
+// goes from it to the next one that is; there is none beyond the first and the last.
+const paces = [1, 2, 5, 8, 10, 12, 15, 20, 24, 30, 60];
+const faster = (pace) => paces.find((next) => next > pace) || pace;
+const slower = (pace) => paces.filter((next) => next < pace).pop() || pace;
+
 function run() {
   const meta = JSON.parse(document.getElementById("meta").textContent);
   const say = document.getElementById("say");
@@ -469,8 +475,7 @@ function begin(meta, read) {
     canvas.style.height = `${matrix.height * scale}px`;
   }
 
-  const paces = [1, 2, 5, 8, 10, 12, 15, 20, 24, 30, 60];
-  const state = { frame: null, playing: false, pace: meta.pace, shown: 0, since: 0, trouble: "" };
+  const state ={ frame: null, playing: false, pace: meta.pace, shown: 0, since: 0, trouble: "" };
   const size = show.origin.length === 1 ? "1 byte" : `${show.origin.length} bytes`;
   const fountain = show.fountain, packets = fountain.symbols;
   function tell() {
@@ -520,15 +525,14 @@ function begin(meta, read) {
 
   window.addEventListener("keydown", (event) => {
     if (event.ctrlKey || event.metaKey || event.altKey) return;
-    const at = paces.indexOf(state.pace);
     if (event.key === "Enter" || event.key === " ") {
       // a file without a byte has nothing but its start screen
       state.playing = !state.playing && packets > 0;
       if (state.playing) fetching(state.frame === null ? 0 : state.frame + 1);
     } else if (event.key === "+" || event.key === "=") {
-      state.pace = paces[Math.min(at + 1, paces.length - 1)];
+      state.pace = faster(state.pace);
     } else if (event.key === "-" || event.key === "_") {
-      state.pace = paces[Math.max(at - 1, 0)];
+      state.pace = slower(state.pace);
     } else if (event.key === "g") {
       state.playing = false;
       state.frame = null;

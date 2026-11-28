@@ -615,6 +615,39 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Where `+` and `-` take a page from the pace it has, which `--rate` may have set to one that the keys
+    /// do not go through. Like the tiles, it takes a JavaScript engine to find out.
+    #[test]
+    fn page_goes_faster_and_slower_from_any_pace() {
+        let driver = r#"
+            const text = await Deno.readTextFile(Deno.args[0]);
+            const script = text.split("<script>")[1].split("</script>")[0];
+            const { faster, slower } = new Function(script + "; return { faster, slower };")();
+            for (const pace of Deno.args.slice(1).map(Number)) console.log(slower(pace), pace, faster(pace));
+        "#;
+        let dir = std::env::temp_dir().join(format!("qqcode-show-paces-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("driver.js"), driver).unwrap();
+        fs::write(dir.join("page.html"), TEMPLATE).unwrap();
+        let run = Command::new("deno")
+            .arg("run")
+            .arg("--allow-read")
+            .arg(dir.join("driver.js"))
+            .arg(dir.join("page.html"))
+            .args(["1", "15", "25", "59", "60"])
+            .output();
+        let _ = fs::remove_dir_all(&dir);
+        let Ok(run) = run else {
+            eprintln!("deno is not installed: where the keys of the page take its pace is not tried");
+            return;
+        };
+        assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(
+            String::from_utf8(run.stdout).unwrap(),
+            "1 1 2\n12 15 20\n24 25 30\n30 59 60\n30 60 60\n"
+        );
+    }
+
     #[test]
     fn file_longer_than_what_is_read_at_a_time_is_identified_whole() {
         // two megabytes and a half, which are read a megabyte at a time
