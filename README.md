@@ -45,6 +45,7 @@ qqcode 2 -o sample.bin --preview                         # camera 2, with a view
 qqcode -o sample.bin --check sample.bin.checksums.txt    # held against the checksums from qqcode-show
 qqcode --threads 4 --buffer 64 > sample.bin              # on a machine with little memory
 qqcode --camera-size 1280x720 > sample.bin               # smaller frames
+qqcode --camera-rate 60 > sample.bin                     # a camera that has sixty frames a second
 qqcode recording.mp4 > sample.bin                        # a video of the show instead of a camera
 qqcode 'frame_%04d.png' > sample.bin                     # or pictures of it
 ```
@@ -58,6 +59,10 @@ qqcode 'frame_%04d.png' > sample.bin                     # or pictures of it
   its page, megabyte by megabyte.
 - `--preview` shows what the camera sees, for pointing it, with the pixels that a tile gets and how fast
   the file arrives; `q` quits.
+- `--camera-rate` is how many frames a second the camera is asked for, 30 unless it says otherwise. A
+  camera gives the nearest rate that it has at its size, and `qqcode` says which when it starts:
+  `camera 0: 1280x960 frames, 30 a second`. The page can be no faster than the camera lets it: the rule
+  of thumb for `--rate` of `qqcode-show` is below.
 
 `qqcode --help` lists every option.
 
@@ -66,6 +71,7 @@ qqcode 'frame_%04d.png' > sample.bin                     # or pictures of it
 ```sh
 qqcode-show assets/sample.txt --html show.html                       # 176x99 tiles, 15 frames a second
 qqcode-show assets/sample.bin --html show.html --scale 16 --rate 12  # more tiles, for a sharp camera
+qqcode-show assets/sample.bin --html show.html --rate 7              # for a camera at 15 frames a second
 qqcode-show assets/sample.bin --html show.html --shape classic       # for a camera with frames of 4:3
 qqcode-show sample.bin.checksums.txt --html list.html                # the checksums, to go ahead of the file
 ```
@@ -74,6 +80,13 @@ The page shows a matrix of coloured tiles, frame after frame without end: 10 kB 
 151 kB a second by default. Any frames that are enough make the file, so one that the camera misses costs
 nothing. The matrix is best shown filling the frames of the camera; where frames are not read, a smaller
 `--scale` or a camera nearer to the screen is the first thing to try.
+
+**The rule of thumb for `--rate`: half of the frames a second that the camera takes.** That is 7 for a
+camera at 15, 15 for one at 30 and 30 for one at 60; `qqcode` says what the camera takes when it starts,
+and `--camera-rate` asks it for more. A frame of the page has to be caught whole, and a page that is
+faster than that is caught while it changes. Where some frames are read and many are missed, the page is
+too fast for the camera: `-` on the page slows it down and `+` finds how fast it can go, without the page
+being written again.
 
 Keys on the page: `enter` or `space` start and pause, `+` and `-` change the frames a second, `g` goes back
 to the start screen, `f` takes the whole screen, `h` hides the notes.

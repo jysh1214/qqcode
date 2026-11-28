@@ -58,6 +58,11 @@ struct Cli {
     #[arg(long, value_parser = parse_size, value_name = "WIDTHxHEIGHT")]
     camera_size: Option<Size>,
 
+    /// Frames a second to ask a camera for, which gives the nearest rate it has at its size. A page is
+    /// read at about half as many frames a second as the camera takes [default: 30]
+    #[arg(long, value_name = "FRAMES", value_parser = clap::value_parser!(u32).range(1..=1000))]
+    camera_rate: Option<u32>,
+
     /// Show what the camera sees on this terminal while reading, with the codes that are found in it
     /// marked, for pointing the camera; q quits
     #[arg(long)]
@@ -113,7 +118,7 @@ fn main() -> Result<()> {
     };
     let sections = checks.as_ref().map(Checks::sections);
     let sha256 = checks.as_ref().map(|checks| checks.sha256.clone());
-    let mut capture = open(&cli.input, cli.camera_size)?;
+    let mut capture = open(&cli.input, cli.camera_size, cli.camera_rate)?;
     // a camera goes on whatever becomes of its frames, a file can wait
     let live = cli.input.parse::<i32>().is_ok();
     let mut log = Log {
@@ -785,12 +790,17 @@ impl Drop for Log {
 }
 
 /// Opens a camera for a plain number, a file or image sequence for anything else. A camera is asked for
-/// frames of `camera_size`, or of [`CAMERA_SIZE`], and says on stderr what frames it gives.
-fn open(input: &str, camera_size: Option<Size>) -> Result<videoio::VideoCapture> {
+/// frames of `camera_size`, or of [`CAMERA_SIZE`], and for `camera_rate` of them a second, or for
+/// [`CAMERA_RATE`], and says on stderr what frames it gives.
+fn open(input: &str, camera_size: Option<Size>, camera_rate: Option<u32>) -> Result<videoio::VideoCapture> {
     let Ok(camera) = input.parse::<i32>() else {
         ensure!(
             camera_size.is_none(),
             "--camera-size is for a camera, which {input} is not"
+        );
+        ensure!(
+            camera_rate.is_none(),
+            "--camera-rate is for a camera, which {input} is not"
         );
         let capture = videoio::VideoCapture::from_file(input, videoio::CAP_ANY)?;
         ensure!(capture.is_opened()?, "can't open {input}");
@@ -798,7 +808,11 @@ fn open(input: &str, camera_size: Option<Size>) -> Result<videoio::VideoCapture>
     };
     let mut capture = videoio::VideoCapture::new(camera, videoio::CAP_ANY)?;
     ensure!(capture.is_opened()?, "can't open camera {camera}");
-    let size = request_size(&mut capture, camera_size.unwrap_or(CAMERA_SIZE))?;
+    let size = request_size(
+        &mut capture,
+        camera_size.unwrap_or(CAMERA_SIZE),
+        camera_rate.map_or(CAMERA_RATE, f64::from),
+    )?;
     let rate = capture.property(videoio::CAP_PROP_FPS)?;
     let pace = if rate > 0.0 {
         format!(", {rate:.0} a second")
@@ -812,7 +826,21 @@ fn open(input: &str, camera_size: Option<Size>) -> Result<videoio::VideoCapture>
             wanted.width, wanted.height
         );
     }
+    if let Some(note) = camera_rate.and_then(|wanted| other_rate(wanted, rate)) {
+        eprintln!("{note}");
+    }
     Ok(capture)
+}
+
+/// What is to be said of a camera that was asked for `wanted` frames a second and gives `given`, if those
+/// are not the same. A camera that does not say what it gives is said nothing of.
+fn other_rate(wanted: u32, given: f64) -> Option<String> {
+    (given > 0.0 && given.round() != wanted as f64).then(|| {
+        format!(
+            "  it has no {wanted} frames a second of this size, this is the nearest rate (`v4l2-ctl \
+             --list-formats-ext` lists them)"
+        )
+    })
 }
 
 /// What is asked of a camera apart from frames. A trait, so that the asking can be tested without a camera.
@@ -844,12 +872,12 @@ fn frame_size(camera: &impl Camera) -> Result<Size> {
 /// Motion JPEG as OpenCV and V4L2 name pixel formats, by the four characters `MJPG`.
 const MOTION_JPEG: f64 = u32::from_le_bytes(*b"MJPG") as f64;
 
-/// Frames a second to ask a camera for, of which it gives as many as it has: what OpenCV asks for when it
-/// opens one.
+/// Frames a second that a camera is asked for unless `--camera-rate` says otherwise, of which it gives as
+/// many as it has: what OpenCV asks for when it opens one.
 const CAMERA_RATE: f64 = 30.0;
 
-/// Asks a camera for frames of `wanted` size. Returns the size it delivers from then on, which is the
-/// nearest it has if it doesn't have that one.
+/// Asks a camera for frames of `wanted` size, `rate` of them a second. Returns the size it delivers from
+/// then on, which is the nearest it has if it doesn't have that one, as the rate is the nearest it has.
 ///
 /// A camera has each of its sizes in certain pixel formats only, and at a frame rate of its own in each.
 /// USB cameras tend to have their large sizes as Motion JPEG alone, or uncompressed at a few frames a
@@ -861,36 +889,36 @@ const CAMERA_RATE: f64 = 30.0;
 /// The frame rate is asked for anew with every size. OpenCV does not: whenever the size or the format
 /// changes, it asks the camera for the rate that the camera had before, so that one which has been at a
 /// size that it has few frames a second of stays that slow at a size that it has thirty of.
-fn request_size(camera: &mut impl Camera, wanted: Size) -> Result<Size> {
-    fn ask(camera: &mut impl Camera, wanted: Size) -> Result<Size> {
+fn request_size(camera: &mut impl Camera, wanted: Size, rate: f64) -> Result<Size> {
+    fn ask(camera: &mut impl Camera, wanted: Size, rate: f64) -> Result<Size> {
         // the camera changes its size when the second of the two arrives
         camera.set_property(videoio::CAP_PROP_FRAME_WIDTH, wanted.width as f64)?;
         camera.set_property(videoio::CAP_PROP_FRAME_HEIGHT, wanted.height as f64)?;
         // a camera that does not take a rate keeps the one it has
-        camera.set_property(videoio::CAP_PROP_FPS, CAMERA_RATE)?;
+        camera.set_property(videoio::CAP_PROP_FPS, rate)?;
         frame_size(camera)
     }
 
-    let given = ask(camera, wanted)?;
+    let given = ask(camera, wanted, rate)?;
     let format = camera.property(videoio::CAP_PROP_FOURCC)?;
     if format == MOTION_JPEG {
         return Ok(given);
     }
-    let rate = camera.property(videoio::CAP_PROP_FPS)?;
+    let uncompressed = camera.property(videoio::CAP_PROP_FPS)?;
     if !camera.set_property(videoio::CAP_PROP_FOURCC, MOTION_JPEG)? {
         return Ok(given);
     }
-    let compressed = ask(camera, wanted)?;
+    let compressed = ask(camera, wanted, rate)?;
     // how far a size is from the one that is wanted, in width and height together
     let off = |size: Size| (size.width - wanted.width).abs() + (size.height - wanted.height).abs();
     let nearer = off(compressed) < off(given);
-    let faster = off(compressed) == off(given) && camera.property(videoio::CAP_PROP_FPS)? > rate;
+    let faster = off(compressed) == off(given) && camera.property(videoio::CAP_PROP_FPS)? > uncompressed;
     if nearer || faster {
         return Ok(compressed);
     }
     // no better for it: back to what the camera gave first
     camera.set_property(videoio::CAP_PROP_FOURCC, format)?;
-    ask(camera, wanted)
+    ask(camera, wanted, rate)
 }
 
 #[cfg(test)]
@@ -1006,7 +1034,7 @@ mod tests {
     #[test]
     fn size_that_is_faster_compressed_switches_to_motion_jpeg() -> Result<()> {
         let mut camera = webcam();
-        assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, CAMERA_SIZE);
+        assert_eq!(request_size(&mut camera, CAMERA_SIZE, CAMERA_RATE)?, CAMERA_SIZE);
         assert_eq!((camera.format, camera.rate), (MOTION_JPEG, 30.0));
         Ok(())
     }
@@ -1019,22 +1047,25 @@ mod tests {
             (YUYV, &[(640, 480, 30.0), (1280, 960, 7.5)]),
             (MOTION_JPEG, &[(640, 480, 30.0), (1280, 960, 30.0)]),
         ]);
-        assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, Size::new(1280, 960));
+        assert_eq!(
+            request_size(&mut camera, CAMERA_SIZE, CAMERA_RATE)?,
+            Size::new(1280, 960)
+        );
         assert_eq!((camera.format, camera.rate), (MOTION_JPEG, 30.0));
         // nor at a smaller size that it is asked for after a large one
         camera.set_property(FORMAT, YUYV)?;
         assert_eq!(
-            request_size(&mut camera, Size::new(1280, 960))?,
+            request_size(&mut camera, Size::new(1280, 960), CAMERA_RATE)?,
             Size::new(1280, 960)
         );
         assert_eq!(
-            request_size(&mut camera, Size::new(640, 480))?,
+            request_size(&mut camera, Size::new(640, 480), CAMERA_RATE)?,
             Size::new(640, 480)
         );
         assert_eq!(camera.rate, 30.0);
         // a camera that has no more of a size gives what it has
         let mut slow = Fake::new(&[(MOTION_JPEG, &[(640, 480, 30.0), (1920, 1080, 15.0)])]);
-        assert_eq!(request_size(&mut slow, CAMERA_SIZE)?, CAMERA_SIZE);
+        assert_eq!(request_size(&mut slow, CAMERA_SIZE, CAMERA_RATE)?, CAMERA_SIZE);
         assert_eq!(slow.rate, 15.0);
         Ok(())
     }
@@ -1043,7 +1074,7 @@ mod tests {
     fn size_that_is_as_fast_uncompressed_stays_uncompressed() -> Result<()> {
         let mut camera = webcam();
         assert_eq!(
-            request_size(&mut camera, Size::new(640, 480))?,
+            request_size(&mut camera, Size::new(640, 480), CAMERA_RATE)?,
             Size::new(640, 480)
         );
         assert_eq!(camera.format, YUYV);
@@ -1056,7 +1087,7 @@ mod tests {
             (YUYV, &[(640, 480, 30.0), (1280, 720, 10.0)]),
             (MOTION_JPEG, &[(640, 480, 30.0), (1920, 1080, 30.0)]),
         ]);
-        assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, CAMERA_SIZE);
+        assert_eq!(request_size(&mut camera, CAMERA_SIZE, CAMERA_RATE)?, CAMERA_SIZE);
         assert_eq!(camera.format, MOTION_JPEG);
         Ok(())
     }
@@ -1068,7 +1099,7 @@ mod tests {
             (MOTION_JPEG, &[(640, 480, 30.0), (1280, 720, 30.0)]),
         ]);
         assert_eq!(
-            request_size(&mut camera, Size::new(1400, 800))?,
+            request_size(&mut camera, Size::new(1400, 800), CAMERA_RATE)?,
             Size::new(1280, 720)
         );
         assert_eq!(camera.format, YUYV);
@@ -1082,14 +1113,20 @@ mod tests {
             (YUYV, &[(640, 480, 30.0)]),
             (MOTION_JPEG, &[(640, 480, 30.0), (1280, 720, 30.0)]),
         ]);
-        assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, Size::new(1280, 720));
+        assert_eq!(
+            request_size(&mut camera, CAMERA_SIZE, CAMERA_RATE)?,
+            Size::new(1280, 720)
+        );
         assert_eq!(camera.format, MOTION_JPEG);
         // and where the uncompressed format does, the camera is left with that
         let mut camera = Fake::new(&[
             (YUYV, &[(640, 480, 30.0), (1280, 720, 10.0)]),
             (MOTION_JPEG, &[(640, 480, 30.0)]),
         ]);
-        assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, Size::new(1280, 720));
+        assert_eq!(
+            request_size(&mut camera, CAMERA_SIZE, CAMERA_RATE)?,
+            Size::new(1280, 720)
+        );
         assert_eq!((camera.format, camera.rate), (YUYV, 10.0));
         Ok(())
     }
@@ -1138,7 +1175,10 @@ mod tests {
     #[test]
     fn camera_without_motion_jpeg_gives_what_it_has() -> Result<()> {
         let mut camera = Fake::new(&[(YUYV, &[(640, 480, 30.0), (800, 600, 15.0)])]);
-        assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, Size::new(800, 600));
+        assert_eq!(
+            request_size(&mut camera, CAMERA_SIZE, CAMERA_RATE)?,
+            Size::new(800, 600)
+        );
         assert_eq!(camera.format, YUYV);
         Ok(())
     }
@@ -1146,9 +1186,9 @@ mod tests {
     #[test]
     fn camera_with_motion_jpeg_alone_is_asked_once() -> Result<()> {
         let mut camera = Fake::new(&[(MOTION_JPEG, &[(640, 480, 30.0), (1920, 1080, 30.0)])]);
-        assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, CAMERA_SIZE);
+        assert_eq!(request_size(&mut camera, CAMERA_SIZE, CAMERA_RATE)?, CAMERA_SIZE);
         assert_eq!(
-            request_size(&mut camera, Size::new(3840, 2160))?,
+            request_size(&mut camera, Size::new(3840, 2160), CAMERA_RATE)?,
             Size::new(1920, 1080)
         );
         Ok(())
@@ -1212,11 +1252,76 @@ mod tests {
 
     #[test]
     fn camera_size_is_refused_for_a_file() {
-        let error = open("recording.mp4", Some(Size::new(1920, 1080))).unwrap_err();
+        let error = open("recording.mp4", Some(Size::new(1920, 1080)), None).unwrap_err();
         assert!(
             error.to_string().contains("--camera-size is for a camera"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn camera_rate_is_refused_for_a_file() {
+        let error = open("recording.mp4", None, Some(60)).unwrap_err();
+        assert!(
+            error.to_string().contains("--camera-rate is for a camera"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn camera_is_asked_for_the_rate_that_is_wanted() -> Result<()> {
+        // a camera that has sixty frames a second of its smaller sizes and thirty of its largest
+        let fast = || {
+            Fake::new(&[
+                (YUYV, &[(640, 480, 30.0), (1280, 720, 10.0), (1920, 1080, 5.0)]),
+                (
+                    MOTION_JPEG,
+                    &[(640, 480, 60.0), (1280, 720, 60.0), (1920, 1080, 30.0)],
+                ),
+            ])
+        };
+        let mut camera = fast();
+        let size = Size::new(1280, 720);
+        assert_eq!(request_size(&mut camera, size, 60.0)?, size);
+        assert_eq!((camera.format, camera.rate), (MOTION_JPEG, 60.0));
+        // thirty unless more are asked for, and fewer where fewer are
+        let mut camera = fast();
+        assert_eq!(request_size(&mut camera, size, CAMERA_RATE)?, size);
+        assert_eq!(camera.rate, 30.0);
+        let mut camera = fast();
+        assert_eq!(request_size(&mut camera, size, 20.0)?, size);
+        assert_eq!((camera.format, camera.rate), (MOTION_JPEG, 20.0));
+        // no more than the camera has of the size
+        let mut camera = fast();
+        assert_eq!(request_size(&mut camera, CAMERA_SIZE, 60.0)?, CAMERA_SIZE);
+        assert_eq!((camera.format, camera.rate), (MOTION_JPEG, 30.0));
+        Ok(())
+    }
+
+    #[test]
+    fn rate_that_the_camera_has_not_is_remarked_on() {
+        let note = other_rate(60, 30.0).expect("a note");
+        assert!(
+            note.contains("it has no 60 frames a second of this size"),
+            "{note}"
+        );
+        assert_eq!(other_rate(30, 30.0), None);
+        // a camera says 29.97 for thirty
+        assert_eq!(other_rate(30, 29.97), None);
+        // and one that says nothing is said nothing of
+        assert_eq!(other_rate(60, 0.0), None);
+    }
+
+    #[test]
+    fn rate_of_the_camera_is_a_number_of_frames() {
+        let parse =
+            |rate: &str| Cli::try_parse_from(["qqcode", "--camera-rate", rate]).map(|cli| cli.camera_rate);
+        assert_eq!(parse("60").unwrap(), Some(60));
+        assert_eq!(parse("1").unwrap(), Some(1));
+        assert_eq!(Cli::try_parse_from(["qqcode"]).unwrap().camera_rate, None);
+        for wrong in ["0", "1001", "-30", "29.97", "fast"] {
+            assert!(parse(wrong).is_err(), "{wrong:?}");
+        }
     }
 
     #[test]
@@ -1249,9 +1354,9 @@ mod tests {
         // a camera with two sizes of the same width: only the height tells them apart
         let modes: &[Mode] = &[(640, 480, 30.0), (1280, 720, 30.0), (1280, 1024, 30.0)];
         let mut camera = Fake::new(&[(MOTION_JPEG, modes)]);
-        let size = request_size(&mut camera, Size::new(1280, 720)).unwrap();
+        let size = request_size(&mut camera, Size::new(1280, 720), CAMERA_RATE).unwrap();
         assert_eq!(size, Size::new(1280, 720));
-        let size = request_size(&mut camera, Size::new(1280, 1024)).unwrap();
+        let size = request_size(&mut camera, Size::new(1280, 1024), CAMERA_RATE).unwrap();
         assert_eq!(size, Size::new(1280, 1024));
     }
 
