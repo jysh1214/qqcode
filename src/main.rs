@@ -818,8 +818,8 @@ const MOTION_JPEG: f64 = u32::from_le_bytes(*b"MJPG") as f64;
 /// USB cameras tend to have their large sizes as Motion JPEG alone, or uncompressed at a few frames a
 /// second, because uncompressed frames of that size don't fit through the cable any faster. OpenCV asks in
 /// the uncompressed format it prefers, so the question is repeated for Motion JPEG, and that is taken
-/// where it comes nearer to the size or brings more frames a second: a page that shows fifteen frames a
-/// second is not read at five, and it is read from a compressed frame as well as from any other.
+/// where it comes nearer to the size, or as near and brings more frames a second: a page that shows fifteen
+/// frames a second is not read at five, and it is read from a compressed frame as well as from any other.
 fn request_size(camera: &mut impl Camera, wanted: Size) -> Result<Size> {
     fn ask(camera: &mut impl Camera, wanted: Size) -> Result<Size> {
         // the camera changes its size when the second of the two arrives
@@ -838,8 +838,10 @@ fn request_size(camera: &mut impl Camera, wanted: Size) -> Result<Size> {
         return Ok(given);
     }
     let compressed = ask(camera, wanted)?;
-    let nearer = given != wanted && compressed == wanted;
-    let faster = compressed == given && camera.property(videoio::CAP_PROP_FPS)? > rate;
+    // how far a size is from the one that is wanted, in width and height together
+    let off = |size: Size| (size.width - wanted.width).abs() + (size.height - wanted.height).abs();
+    let nearer = off(compressed) < off(given);
+    let faster = off(compressed) == off(given) && camera.property(videoio::CAP_PROP_FPS)? > rate;
     if nearer || faster {
         return Ok(compressed);
     }
@@ -992,6 +994,25 @@ mod tests {
             Size::new(1280, 720)
         );
         assert_eq!(camera.format, YUYV);
+        Ok(())
+    }
+
+    #[test]
+    fn size_the_camera_has_in_neither_format_is_the_nearer_of_the_two() -> Result<()> {
+        // Motion JPEG comes nearer to the size that is wanted, and has it not
+        let mut camera = Fake::new(&[
+            (YUYV, &[(640, 480, 30.0)]),
+            (MOTION_JPEG, &[(640, 480, 30.0), (1280, 720, 30.0)]),
+        ]);
+        assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, Size::new(1280, 720));
+        assert_eq!(camera.format, MOTION_JPEG);
+        // and where the uncompressed format does, the camera is left with that
+        let mut camera = Fake::new(&[
+            (YUYV, &[(640, 480, 30.0), (1280, 720, 10.0)]),
+            (MOTION_JPEG, &[(640, 480, 30.0)]),
+        ]);
+        assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, Size::new(1280, 720));
+        assert_eq!((camera.format, camera.mode.2), (YUYV, 10.0));
         Ok(())
     }
 
