@@ -626,11 +626,27 @@ fn named(pipeline: &Pipeline) -> String {
     }
 }
 
-/// `2048 of 12345 bytes`: how much of the file on show has arrived.
+/// `16.5 %`: how much of a whole a part of it is, in parts of a hundred and tenths of one. It is not
+/// rounded up, so that a file is at 100 when all of it has arrived and not before; a file without a byte
+/// is whole.
+fn share(part: u64, whole: u64) -> String {
+    let tenths = if whole == 0 {
+        1000
+    } else {
+        part as u128 * 1000 / whole as u128
+    };
+    format!("{}.{} %", tenths / 10, tenths % 10)
+}
+
+/// `2048 of 12345 bytes (16.5 %)`: how much of the file on show has arrived.
 fn progress(pipeline: &Pipeline) -> String {
     match (pipeline.received(), pipeline.file()) {
         (Some(received), Some(file)) => {
-            let bytes = format!("{received} of {}", count(file.length as usize, "byte"));
+            let bytes = format!(
+                "{received} of {} ({})",
+                count(file.length as usize, "byte"),
+                share(received, file.length)
+            );
             let packets = match pipeline.packets() {
                 Some((held, needed)) => format!("{bytes}, {held} of {needed} packets"),
                 None => bytes,
@@ -1245,6 +1261,59 @@ mod tests {
         // number that a camera answers with when it is asked for its format, and that it is told.
         assert_eq!(MOTION_JPEG, 1_196_444_237.0);
         assert_eq!(MOTION_JPEG as u32 & 0xff, u32::from(b'M'));
+    }
+
+    #[test]
+    fn share_of_a_file_is_said_in_tenths_and_not_rounded_up() {
+        assert_eq!(share(0, 12345), "0.0 %");
+        assert_eq!(share(2048, 12345), "16.5 %");
+        assert_eq!(share(6173, 12345), "50.0 %");
+        // all but a byte is not all
+        assert_eq!(share(12344, 12345), "99.9 %");
+        assert_eq!(share(12345, 12345), "100.0 %");
+        assert_eq!(share(0, 0), "100.0 %");
+        // the longest file that is taken, and numbers that do not fit when multiplied
+        assert_eq!(share(1 << 39, 1 << 40), "50.0 %");
+        assert_eq!(share(u64::MAX - 1, u64::MAX), "99.9 %");
+    }
+
+    #[test]
+    fn progress_says_how_much_of_the_file_has_arrived() -> Result<()> {
+        use qqcode::fountain::Encoder;
+        use qqcode::packet::Frame;
+
+        let mut pipeline = Pipeline::new();
+        assert_eq!(progress(&pipeline), "no code of qqcode-show read");
+        // a file of four packets of 5000 bytes and three packets of it
+        let file = (0..20_000u32).map(|at| (at * 7) as u8).collect::<Vec<_>>();
+        let origin = Origin::of(&file);
+        let encoder = Encoder::new(&file, origin.checksum, 5000);
+        let found = |frame: Frame| {
+            vec![Found {
+                outline: [opencv::core::Point2f::default(); 4],
+                modules: 128,
+                frame: Some(frame),
+                wrong: 0.0,
+            }]
+        };
+        let name = "notes.bin".to_owned();
+        pipeline.take(found(Frame::Start { origin, name }))?;
+        assert_eq!(progress(&pipeline), "0 of 20000 bytes (0.0 %)");
+        for (sequence, said) in [
+            (0, "5000 of 20000 bytes (25.0 %), 1 of 4 packets"),
+            (2, "10000 of 20000 bytes (50.0 %), 2 of 4 packets"),
+            (3, "15000 of 20000 bytes (75.0 %), 3 of 4 packets"),
+        ] {
+            let bytes = encoder.packet(0, sequence);
+            pipeline.take(found(Frame::Packet {
+                origin,
+                block: 0,
+                sequence,
+                bytes,
+            }))?;
+            assert_eq!(progress(&pipeline), said);
+        }
+        Ok(())
     }
 
     #[test]
