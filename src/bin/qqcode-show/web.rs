@@ -615,10 +615,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Where `+` and `-` take a page from the pace it has, which `--rate` may have set to one that the keys
-    /// do not go through. Like the tiles, it takes a JavaScript engine to find out.
+    /// Where `+` and `-` take a page from the pace it has: a frame a second further, and no further than
+    /// `--rate` goes. Like the tiles, it takes a JavaScript engine to find out.
     #[test]
-    fn page_goes_faster_and_slower_from_any_pace() {
+    fn page_goes_faster_and_slower_by_a_frame_a_second() {
         let driver = r#"
             const text = await Deno.readTextFile(Deno.args[0]);
             const script = text.split("<script>")[1].split("</script>")[0];
@@ -644,7 +644,7 @@ mod tests {
         assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
         assert_eq!(
             String::from_utf8(run.stdout).unwrap(),
-            "1 1 2\n12 15 20\n24 25 30\n30 59 60\n30 60 60\n"
+            "1 1 2\n14 15 16\n24 25 26\n58 59 60\n59 60 60\n"
         );
     }
 

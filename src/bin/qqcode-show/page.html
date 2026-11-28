@@ -366,11 +366,10 @@ async function fileChecksum(file, progress) {
 }
 
 // ---- the screen
-// The frames a second that + and - go through. A page may be written for a pace that is none of them, and
-// goes from it to the next one that is; there is none beyond the first and the last.
-const paces = [1, 2, 5, 8, 10, 12, 15, 20, 24, 30, 60];
-const faster = (pace) => paces.find((next) => next > pace) || pace;
-const slower = (pace) => paces.filter((next) => next < pace).pop() || pace;
+// The frames a second that + and - go through: one more or one less at a time, from 1 to 60, which is
+// as far as --rate goes.
+const faster = (pace) => Math.min(pace + 1, 60);
+const slower = (pace) => Math.max(pace - 1, 1);
 
 function run() {
   const meta = JSON.parse(document.getElementById("meta").textContent);
