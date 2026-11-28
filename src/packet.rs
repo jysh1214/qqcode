@@ -12,7 +12,7 @@
 //! what keeps a frame that was put right wrongly out of the sums of [`crate::fountain`], where one wrong
 //! packet would spoil a whole block.
 
-use crate::protocol::checksum;
+use crate::crc::checksum;
 
 const MARK: [u8; 2] = *b"qq";
 const START: u8 = 0x10;
@@ -81,7 +81,7 @@ impl Frame {
         frame.extend(sequence.to_be_bytes());
         match self {
             Frame::Start { name, .. } => {
-                let name = crate::protocol::fit_name(name, (capacity - OVERHEAD - 2).min(u16::MAX as usize));
+                let name = fit_name(name, (capacity - OVERHEAD - 2).min(u16::MAX as usize));
                 frame.extend((name.len() as u16).to_be_bytes());
                 frame.extend(name.as_bytes());
                 frame.resize(capacity - 4, 0);
@@ -128,6 +128,15 @@ impl Frame {
             _ => None,
         }
     }
+}
+
+/// The longest beginning of `name` that is no more than `room` bytes.
+fn fit_name(name: &str, room: usize) -> &str {
+    let mut end = name.len().min(room);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 #[cfg(test)]
@@ -210,6 +219,16 @@ mod tests {
             panic!("a start frame");
         };
         assert!(name.starts_with("?"), "{name}");
+    }
+
+    #[test]
+    fn name_is_cut_between_characters() {
+        assert_eq!(fit_name("notes.txt", 20), "notes.txt");
+        assert_eq!(fit_name("notes.txt", 5), "notes");
+        // two bytes for the ü
+        assert_eq!(fit_name("grün", 3), "gr");
+        assert_eq!(fit_name("grün", 4), "grü");
+        assert_eq!(fit_name("grün", 0), "");
     }
 
     #[test]

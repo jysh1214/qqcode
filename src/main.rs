@@ -3,7 +3,6 @@ mod preview;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Write};
-use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,11 +16,10 @@ use opencv::core::{Mat, Size};
 use opencv::prelude::*;
 use opencv::videoio;
 
-use qqcode::assembly::Assembly;
 use qqcode::checks::Checks;
+use qqcode::crc::Checksum;
 use qqcode::digest::{self, Digests};
 use qqcode::packet::Origin;
-use qqcode::protocol::Checksum;
 use qqcode::scan::{Found, Scanner};
 use qqcode::{Kind, Outcome, Pipeline, Survey};
 
@@ -222,35 +220,12 @@ fn main() -> Result<()> {
                         ));
                     }
                 }
-                Outcome::Piece { new, skipped } => {
-                    screen = Some(Shown::Codes);
-                    if skipped > 0 {
-                        log.say(format!(
-                            "frame {frames}: {} went by unread",
-                            count(skipped, "byte")
-                        ));
-                    }
-                    if new > 0 {
-                        log.tell(format!("frame {frames}: {}", progress(&pipeline)));
-                    }
-                }
                 Outcome::Packet { new } => {
                     screen = Some(Shown::Codes);
                     // a line a second, not one for each of the frames
                     if new && told_at.elapsed() >= Duration::from_secs(1) {
                         told_at = Instant::now();
                         log.tell(format!("frame {frames}: {}", progress(&pipeline)));
-                    }
-                }
-                Outcome::Done => {
-                    screen = Some(Shown::End);
-                    if screen_before != screen {
-                        let missing = pipeline
-                            .assembly()
-                            .map_or(String::new(), |assembly| format!(", {}", lacking(assembly)));
-                        log.say(format!(
-                            "frame {frames}: end screen in view{missing}; g in qqcode-show shows the codes again"
-                        ));
                     }
                 }
                 Outcome::Corrupt => {
@@ -365,9 +340,6 @@ fn main() -> Result<()> {
         bail!("no frame could be read from {}", cli.input);
     }
     eprintln!("{frames} frames read, nothing written");
-    if let Some(assembly) = pipeline.assembly() {
-        bail!("the file is not whole: {}", lacking(assembly));
-    }
     if let Some((held, needed)) = pipeline.packets() {
         let kept = store.map_or(String::new(), |store| {
             format!(
@@ -377,11 +349,16 @@ fn main() -> Result<()> {
         });
         bail!("the file is not whole: {held} of the {needed} packets it takes have arrived{kept}");
     }
-    if unread > 0 {
-        bail!(
-            "no code of qqcode-show was read; {unread} frames showed one that could not be: nearer, sharper, \
-             or larger modules"
-        );
+    if pipeline.file().is_some() {
+        // its start screen, and no packet that is kept
+        let unread = match unread {
+            0 => String::new(),
+            unread => format!(
+                "; {} showed the page and could not be read: nearer, sharper, or a smaller --scale",
+                count(unread as usize, "frame")
+            ),
+        };
+        bail!("the file is not whole: none of its packets is at hand{unread}");
     }
     bail!("no frame showed a code of qqcode-show")
 }
@@ -582,7 +559,6 @@ fn capture_frames(
 enum Shown {
     Start,
     Codes,
-    End,
 }
 
 /// `1 byte`, `2 bytes`.
@@ -700,35 +676,6 @@ impl Steady {
     }
 }
 
-/// `1092 of 3000 bytes are missing: 0 to 545, 1638 to 2183`
-fn lacking(assembly: &Assembly) -> String {
-    let missing = assembly.missing();
-    let bytes = missing.iter().map(Range::len).sum::<usize>();
-    let are = if bytes == 1 { "is" } else { "are" };
-    format!(
-        "{bytes} of {} {are} missing: {}",
-        count(assembly.file().length as usize, "byte"),
-        ranges(&missing)
-    )
-}
-
-/// `0 to 545, 1638 to 2183`, and no more than a line of it.
-fn ranges(ranges: &[Range<usize>]) -> String {
-    const SHOWN: usize = 6;
-    let mut parts = ranges
-        .iter()
-        .take(SHOWN)
-        .map(|range| match range.len() {
-            1 => range.start.to_string(),
-            _ => format!("{} to {}", range.start, range.end - 1),
-        })
-        .collect::<Vec<_>>();
-    if ranges.len() > SHOWN {
-        parts.push(format!("and {} more parts", ranges.len() - SHOWN));
-    }
-    parts.join(", ")
-}
-
 /// Where the remarks about the run go: to stderr, at once or, while the preview has the terminal, when it
 /// has given it back.
 struct Log {
@@ -843,9 +790,8 @@ const MOTION_JPEG: f64 = u32::from_le_bytes(*b"MJPG") as f64;
 /// USB cameras tend to have their large sizes as Motion JPEG alone, or uncompressed at a few frames a
 /// second, because uncompressed frames of that size don't fit through the cable any faster. OpenCV asks in
 /// the uncompressed format it prefers, so the question is repeated for Motion JPEG, and that is taken
-/// where it comes nearer to the size or brings more frames a second: a code that is on show for half a
-/// second is easily missed at five frames a second, and it is read from a compressed frame as well as from
-/// any other.
+/// where it comes nearer to the size or brings more frames a second: a page that shows fifteen frames a
+/// second is not read at five, and it is read from a compressed frame as well as from any other.
 fn request_size(camera: &mut impl Camera, wanted: Size) -> Result<Size> {
     fn ask(camera: &mut impl Camera, wanted: Size) -> Result<Size> {
         // the camera changes its size when the second of the two arrives
@@ -876,8 +822,6 @@ fn request_size(camera: &mut impl Camera, wanted: Size) -> Result<Size> {
 
 #[cfg(test)]
 mod tests {
-    use qqcode::protocol::FileId;
-
     use super::*;
 
     const WIDTH: i32 = videoio::CAP_PROP_FRAME_WIDTH;
@@ -1067,25 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_parts_are_named() {
-        let mut assembly = Assembly::new(FileId {
-            checksum: 0,
-            length: 3000,
-        });
-        assert_eq!(lacking(&assembly), "3000 of 3000 bytes are missing: 0 to 2999");
-        assembly.add(546, &[0; 1092]);
-        assembly.add(2184, &[0; 815]);
-        assert_eq!(
-            lacking(&assembly),
-            "1093 of 3000 bytes are missing: 0 to 545, 1638 to 2183, 2999"
-        );
-        assembly.add(0, &[0; 2999]);
-        assert_eq!(lacking(&assembly), "1 of 3000 bytes is missing: 2999");
-        let many = (0..10).map(|part| 10 * part..10 * part + 5).collect::<Vec<_>>();
-        assert_eq!(
-            ranges(&many),
-            "0 to 4, 10 to 14, 20 to 24, 30 to 34, 40 to 44, 50 to 54, and 4 more parts"
-        );
+    fn numbers_are_said_with_what_they_count() {
         assert_eq!(
             (count(1, "byte"), count(2, "byte")),
             ("1 byte".to_owned(), "2 bytes".to_owned())
@@ -1149,7 +1075,7 @@ mod tests {
                 kind,
                 modules: 80,
                 module_size: 15.0,
-                wrong: Some(0.0),
+                wrong: 0.0,
             }],
         };
         let (read, unread, nothing) = (sight(Kind::Piece), sight(Kind::Unread), Survey::default());
@@ -1170,7 +1096,7 @@ mod tests {
         assert_eq!(steady.show(&unread, at(600)), &unread);
         assert_eq!(steady.show(&nothing, at(600)), &nothing);
         // another code that is read comes at once
-        let other = sight(Kind::Other);
+        let other = sight(Kind::Start);
         steady.take(&other, at(700));
         assert_eq!(steady.show(&other, at(700)), &other);
         assert_eq!(steady.show(&unread, at(750)), &other);

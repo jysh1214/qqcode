@@ -32,8 +32,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::checks::{Checks, Note};
+use crate::crc;
 use crate::fountain::{self, Block, Plan, Row};
-use crate::protocol;
 
 /// How many sums more than it has symbols a block takes while it is whole and not yet known to be right.
 /// Each halves the packets that may be the one that was misread, so these leave no doubt.
@@ -92,7 +92,7 @@ fn index_of(bytes: &[u8]) -> io::Result<(Kept, u64, Rest<'_>)> {
     let (rest, checksum) = rest
         .split_last_chunk()
         .ok_or_else(|| no_index("it ends too early"))?;
-    if protocol::checksum(&bytes[..bytes.len() - 4]) != u32::from_be_bytes(*checksum) {
+    if crc::checksum(&bytes[..bytes.len() - 4]) != u32::from_be_bytes(*checksum) {
         return Err(no_index("its checksum is wrong"));
     }
     let mut rest = Rest(rest);
@@ -357,7 +357,7 @@ impl Stored {
                 bytes.extend(at.to_be_bytes());
             }
         }
-        bytes.extend(protocol::checksum(&bytes).to_be_bytes());
+        bytes.extend(crc::checksum(&bytes).to_be_bytes());
         let mut aside = index.clone().into_os_string();
         aside.push(".new");
         let mut file = File::create(&aside)?;
@@ -1853,7 +1853,7 @@ mod tests {
         // of where it comes from.
         let signed = |mut bytes: Vec<u8>| {
             let end = bytes.len() - 4;
-            let checksum = protocol::checksum(&bytes[..end]);
+            let checksum = crc::checksum(&bytes[..end]);
             bytes[end..].copy_from_slice(&checksum.to_be_bytes());
             bytes
         };

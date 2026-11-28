@@ -1,30 +1,24 @@
 # qqcode
 
-Carries a file from one machine to another through a screen and a camera. `qqcode-show` puts the file on
-the screen, `qqcode` reads it from the frames of a camera and writes it. Written in Rust; the frames come
-through OpenCV.
+Carries a file from one machine to another through a screen and a camera. `qqcode-show` writes a web page
+that puts the file on the screen, `qqcode` reads it from the frames of a camera and writes it. Written in
+Rust; the frames come through OpenCV.
 
 ```sh
 qqcode-show notes.tar.gz --html show.html     # where the file is: a page for a browser the camera sees
 qqcode > notes.tar.gz                         # where the camera is
 ```
 
-There are two ways to show a file, and `qqcode` reads either:
-
-| | on show | a frame holds | a second holds |
-| --- | --- | --- | --- |
-| [web page](#the-web-page), `--html` | a matrix of coloured tiles, frame after frame without end | 10 kB by default, up to some 21 kB for a camera of 1920x1080 | 151 kB at 15 frames |
-| [terminal](#qqcode-show-on-a-terminal) | QR codes drawn with half block characters, one after the other | 0.8 kB on a terminal of 200x60 cells, 2.9 kB at most | 1.7 kB at 2 codes |
-
-The terminal needs nothing but a terminal. The page is what to use where a browser is to be had: it is some
-ninety times faster, and a frame that the camera misses costs it nothing, as any frames that are enough
-make the file.
+The [page](#the-web-page) shows a matrix of coloured tiles, frame after frame without end. A frame holds
+10 kB of the file by default and up to some 21 kB for a camera of 1920x1080, which is 151 kB a second at
+15 frames. A frame that the camera misses costs nothing, as any frames that are enough make the file.
 
 `qqcode`, per frame:
 
-1. finds the finder patterns in it (those of a QR code, which the matrix has in its corners as well);
-2. reads the matrix between four of them, tile by tile, or decodes the QR code (the QR reader of `rxing`);
-3. takes what the frame says into the file: a packet of the page, or the piece that a QR code holds;
+1. finds the finder patterns in it, which the matrix has in its four corners (they are those of a QR code,
+   and found by the QR reader of `rxing`);
+2. reads the matrix between them, tile by tile;
+3. takes the packet that the frame holds into the file;
 4. once the file is whole, checks its checksum, writes it and ends.
 
 The frames go from the camera into a buffer and are read by as many threads as the machine has processors,
@@ -79,7 +73,7 @@ qqcode 'frame_%04d.png' > notes.tar.gz                 # or pictures of it
 | Option | Default | |
 | --- | --- | --- |
 | input | `0` | camera index, or a video file, an image or an image sequence |
-| `-o`, `--output` | the standard output | file to write; a file from a web page is put together on disk as it arrives, see [long files](#long-files), and a run that is stopped is [gone on with](#going-on-with-a-file) by the next |
+| `-o`, `--output` | the standard output | file to write; it is put together on disk as it arrives, see [long files](#long-files), and a run that is stopped is [gone on with](#going-on-with-a-file) by the next |
 | `--check` | | the checksums of the file that is to arrive, which it is held against; see [checksums ahead of the file](#checksums-ahead-of-the-file) |
 | `--camera-size` | `1920x1080` | frame size to ask a camera for, `WIDTHxHEIGHT`; see below |
 | `--preview` | off | show what the camera sees on the terminal, with the codes that are found; see below |
@@ -88,27 +82,25 @@ qqcode 'frame_%04d.png' > notes.tar.gz                 # or pictures of it
 
 The file is there when it is whole and its checksum is right, and nothing of it before that: a run that is
 stopped, or whose video ends too early, leaves an empty file behind `>` and none at all behind `-o`, and
-ends with an error. What a web page had shown of the file by then is kept next to where `-o` puts it, and
-the same command [goes on with it](#going-on-with-a-file). The file goes to the standard output, so
-`qqcode` refuses to start with that being the terminal. What it has to say while it runs goes to the
-standard error:
+ends with an error. What had arrived of the file by then is kept next to where `-o` puts it, and the same
+command [goes on with it](#going-on-with-a-file). The file goes to the standard output, so `qqcode` refuses
+to start with that being the terminal. What it has to say while it runs goes to the standard error, with
+a line a second for how far the file has come; here for `assets/sample.bin`:
 
 ```
 camera 0: 1920x1080 frames, 30 a second
-frame 31: start screen in view: notes.tar.gz, 3000 bytes, waiting for the first code
-frame 58: 842 of 3000 bytes
-frame 64: 1684 of 3000 bytes
-frame 70: 2526 of 3000 bytes
-frame 76: the file is whole
-76 frames read, 3000 bytes written to the standard output
-SHA-256 03172bf1dc18c2c972ff3b2cca2fcf4e800c6dd590474210b53c193aaeaf8bc9
-MD5 7850bf91f76b3d7e90d3b7b4eacec425
+frame 31: start screen in view: sample.bin, 65536 bytes, waiting for the first code
+frame 58: 10077 of 65536 bytes, 1 of 7 packets
+frame 70: the file is whole
+70 frames read, 65536 bytes written to the standard output
+SHA-256 d060b80065d3d79686baaf6c41801d46ff93365dd414bd30501029ce5838f061
+MD5 62b80e7f487ffaae9158a421f8defc52
 ```
 
-The last two lines are the SHA-256 and the MD5 of the file as it was written. `qqcode-show` has those of
-the file it shows on its end screen and prints them when it quits, and `sha256sum` and `md5sum` say the
-same of either file: they are there to be compared, by whoever wants more than the checksum in the codes,
-which `qqcode` has checked by then.
+The last two lines are the SHA-256 and the MD5 of the file as it was written. `qqcode-show` prints those
+of the file it shows when it writes the page, and `sha256sum` and `md5sum` say the same of either file:
+they are there to be compared, by whoever wants more than the checksum in the frames, which `qqcode` has
+checked by then.
 
 ### Frames that wait
 
@@ -123,42 +115,22 @@ is lost by reading slowly but time. Only when that many are waiting are the fram
 `qqcode` says at the end how many were. A frame of 1920x1080 takes 6 MB while it waits, so the 256 of the
 default come to 1.6 GB at worst. A video file or pictures are never dropped: reading them waits for room.
 
-### Codes that are missed
-
-What follows is about the QR codes of a terminal. A page has no codes to miss: it goes on showing packets,
-and `qqcode` ends when it has enough of them.
-
-A code that no frame shows sharply enough is a hole in the file. `qqcode` says so when the next code comes
-(`frame 64: 842 bytes went by unread`), and when the end screen comes it names what is missing:
-
-```
-frame 90: end screen in view, 842 of 3000 bytes are missing: 842 to 1683; g in qqcode-show shows the codes again
-```
-
-It goes on reading then. `g` in `qqcode-show` begins the show again, and `qqcode` takes from the second
-round what it lacks and ends as soon as it has everything; codes it has read before cost it nothing. The
-rounds need not be alike: a show with larger modules, slower, or in a window of another size fills the same
-file, as every code says where its bytes go rather than which code it is.
-
-Should all pieces arrive and the checksum be wrong, a code was misread in a way that its own error
-correction did not notice. `qqcode` says so, drops what it has and collects the file anew.
-
 ### Cameras
 
 A camera delivers the size it starts up with, which is 640x480 for nearly all of them and too little for
-codes of any size, so `qqcode` asks for 1920x1080 unless `--camera-size` names another size. It says which
+a matrix of any size, so `qqcode` asks for 1920x1080 unless `--camera-size` names another size. It says which
 frames it gets when it starts; if the camera does not have the size asked for, those are of the nearest one
 it has, and `v4l2-ctl --list-formats-ext` lists them all. USB cameras tend to have their large sizes as
 Motion JPEG only, or uncompressed at a few frames a second, so `qqcode` switches to Motion JPEG where that
-comes nearer to the size or brings more frames a second: a code that is on show for half a second is easily
-missed at five frames a second.
+comes nearer to the size or brings more frames a second: a page that shows fifteen frames a second is not
+read at five.
 
 To point the camera, `--preview` draws what it sees on the terminal that `qqcode` runs in, a frame at a
 time, as coarse as the terminal has character cells (a smaller font gives a finer picture). In the picture
-a code of `qqcode-show` that is read is outlined in green and any other QR code in magenta; one that can't be
-read has no outline. The lines below it say what the code in view is, how many modules it has to a side and
-how many pixels of the frame a module gets, what to do about it, how fast the file arrives and how much of
-it has.
+the matrix of `qqcode-show` is outlined in green where it is read; one that can't be read has no outline.
+The lines below it say what is in view, how many tiles the matrix has across, how many pixels of the frame
+a tile gets and how much of the frame had to be put right, what to do about it, how fast the file arrives
+and how much of it has.
 
 How fast is `27.4 kB a second`, over the last five seconds: the number to try another `--scale`, another
 `--rate` or another place for the camera by. A camera takes one frame in every few while the page changes,
@@ -212,7 +184,7 @@ follow, `--rate` of them a second, without end. `qqcode` ends by itself when it 
 
 | Option | Default | |
 | --- | --- | --- |
-| `--html` | | file to write the page to; the [checksums of the file](#checksums-ahead-of-the-file) go next to it, as `NAME.checksums.txt` |
+| `--html` | | file to write the page to, which has to be named; the [checksums of the file](#checksums-ahead-of-the-file) go next to it, as `NAME.checksums.txt` |
 | `--shape` | `wide` | shape of the matrix: `wide` is 16:9, `classic` 4:3, `square` 1:1; best that of the camera's frames |
 | `--scale` | `11` | size of the matrix, 4 to 24: it has 9 rows of tiles for each |
 | `--rate` | `15` | frames a second, 1 to 60 |
@@ -290,8 +262,9 @@ they are not what the frames said, the file stays `FILE.part` and `qqcode` ends 
 ends before the file is whole leaves both where they are, see [going on with a file](#going-on-with-a-file).
 
 Without `-o` the file goes to the standard output in one piece when it is whole, and is kept in memory
-until then, which is as before and fine for a file that fits there; `qqcode` says so when it sees that a
-file of more than 1 GB is coming.
+until then, which is fine for a file that fits there; `qqcode` says so when it sees that a file of more
+than 1 GB is coming. Should all of it arrive and its checksum be wrong, a frame was misread in a way that
+its check did not notice: `qqcode` says so, drops what it has and collects the file anew.
 
 Measured with a file of 1.5 GB at the default size, whose packets were given to the reader as a camera
 would, without the pictures in between; the time is that of the show, the first round being 3 h 2 min:
@@ -441,120 +414,34 @@ pixels, as it finds the tiles area by area rather than where the corners put the
 colours as the frame has them rather than as they ought to be, but how far that goes with a given camera
 only that camera can tell.
 
-## `qqcode-show` on a terminal
+### What a frame says
 
-```sh
-qqcode-show notes.tar.gz                              # a new code every half second
-qqcode-show notes.tar.gz --interval 0.2 --level l     # faster, and more in a code
-qqcode-show notes.tar.gz --interval 0                 # the codes turn by key
-```
-
-`qqcode-show` begins on a start screen and waits there. Its code is of the size that the codes of the file
-will have, and says what the file is called and how long it is. `qqcode` says when it has that screen in
-view, which is the moment to press `enter`: the codes follow, every `--interval` seconds or by key, and
-after the last one an end screen. `qqcode` ends by itself with the code that completes the file. If it
-names missing parts at the end screen instead, `g` shows the codes again.
-
-The code is drawn with half block characters, a module of it as a square of half a character cell, and it
-is as large as the terminal has room for: the larger the window and the smaller the font, the more modules,
-and the fewer codes for a file. Beside the code, or below it in a narrow window, there is a panel that says
-what is on show. The file is cut anew whenever the window, the font or one of the settings below changes,
-and the code that is on show then is the one with the byte that the code before began with.
-
-| Terminal | Code | Bytes of the file in a code at level `m` |
-| --- | --- | --- |
-| 80x24 cells | version 5, 37 modules | 69 |
-| 120x40 | version 13, 69 modules | 316 |
-| 200x60 | version 23, 109 modules | 842 |
-| 213x93 and more | version 40, 177 modules | 2316 |
-
-At a code every half second that is 1.7 kB a second on a terminal of 200x60 cells, 100 kB a minute.
-
-The rest is set with options, and with keys while the codes are on show:
-
-| Option | Keys | Default | |
-| --- | --- | --- | --- |
-| `--module` | `+` `-` | `1` | size of a module: this many columns wide and half as many rows high |
-| `--margin` | `}` `{` | `4` | blank space on every side of the code, in modules; four is what the standard asks for |
-| `--max-version` | `.` `,` | `40` | the largest version a code may have where there is room for more: version 1 has 21 modules to a side, every further one 4 more |
-| `--level` | `e` | `m` | error correction: `l`, `m`, `q` or `h` put right a code of which some 7, 15, 25 or 30 % is misread, and hold less the more they put right |
-| `--interval` | `f` `s` | `0.5` | seconds a code stays; `0` leaves the turning to the keys |
-| `--no-notes` | `h` | shown | what is on show, the measurements and the keys in the panel |
-| `--ink`, `--paper` | | `000000`, `ffffff` | the dark and the light colour as `RRGGBB`; a grey paper dims a screen that glares |
-
-`enter`, `space` and `n` go to the next code, `p` to the one before, `g` and `G` to the first and the last.
-`q` quits and prints the options for the layout as it was then, along with what the terminal measured, so
-that a setup that read well can be noted down and shown again, and the SHA-256 and the MD5 of the file, to
-be compared with those that `qqcode` prints:
-
-```
-qqcode-show notes.tar.gz --module 1 --margin 4 --level m --interval 0.2
-terminal 200x60 cells, cell 9x18 px, version 23, code 109x54.5 cells = 981x981 px, 842 bytes a code, 4 codes
-SHA-256 03172bf1dc18c2c972ff3b2cca2fcf4e800c6dd590474210b53c193aaeaf8bc9
-MD5 7850bf91f76b3d7e90d3b7b4eacec425
-```
-
-### How large the modules have to be
-
-What counts is how many pixels of the camera's frames a module gets, which `qqcode --preview` shows for
-the code in view (`109 modules | 7.9 px a module`). Measured on synthetic frames of 1920x1080, with codes
-of the versions 10 to 40 at the levels `l` and `m`, eight frames each; no camera took part:
-
-| Frame | Every code is read from |
-| --- | --- |
-| sharp, seen straight on | 2 px a module |
-| seen at a slight angle, Gaussian blur of 1 px, some noise | 3 px |
-| the same with a blur of 1.5 px | 5 px |
-| the same with a blur of 2 px | 6 px |
-
-The version made no difference to that and the level hardly any. A camera adds things that these frames do
-not have, such as moiré between its pixels and those of the screen, glare, and the distortion of its lens,
-which a code of 177 modules forgives less than one of 57. So the first thing to do with a new setup is to
-look at the start screen through `--preview`: if its code is outlined in red, or the pixels a module come
-to less than 4 or so, press `+` for larger modules or `,` for smaller codes until it is read, and move the
-camera nearer if there is room. A frame of 1920x1080 takes `qqcode` about 5 ms to search, so the camera
-sets the pace: at 30 frames a second a code that stays for 0.2 s is in six frames, of which the one or two
-taken while the screen changes show two codes at once and are read as none.
-
-### What a code says
-
-Every QR code holds one message, in the byte mode of QR codes:
-
-```
-start   "qq" 1 checksum length name...
-piece   "qq" 2 checksum length offset bytes...
-end     "qq" 3 checksum length
-```
-
-The checksum is the CRC-32 of the whole file and names the file together with its length; both are
-numbers of 32 bits, most significant byte first, as is the offset, so a file can have 4 GiB less a byte. A
-QR code that does not begin like this is none of `qqcode-show` and is passed over, and codes of another
-file than the one being read make `qqcode` start over with that file. The SHA-256 and the MD5 that both
-programs print are not in the codes.
-
-A frame of the web page is always full, and says:
+What the tiles of a frame hold, once they are read and put right. A frame is always full, and says:
 
 ```
 start    "qq" 0x10 checksum length 0     0        length of the name, name, zeros     check
 packet   "qq" 0x11 checksum length block sequence bytes of the packet                 check
 ```
 
-The length is a number of 64 bits here; block and sequence say which packet of which block this is, from
-which follows what it is the sum of; and the check is the CRC-32 of the frame, which keeps a frame that
-was put right wrongly out of the sums, where it would spoil a whole block.
+The checksum is the CRC-32 of the whole file and names the file together with its length, which is a
+number of 64 bits; block, sequence and the check are of 32 bits, the length of the name is of 16, and all
+of them have their most significant byte first. Block and sequence say which packet of which block this
+is, from which follows what it is the sum of; and the check is the CRC-32 of the frame, which keeps a frame
+that was put right wrongly out of the sums, where it would spoil a whole block. Frames of another file
+than the one being read make `qqcode` start over with that file. The SHA-256 and the MD5 that both
+programs print are not in the frames.
 
 ## Files to try it with
 
 `assets/` has two files to show:
 
-| File | Bytes | What | On the web page | On a terminal of 200x60 cells |
-| --- | --- | --- | --- | --- |
-| `assets/sample.txt` | 3758 | text to look at once it has arrived: prose, every printable ASCII character, two lines of Chinese, numbered lines | 1 frame | 5 codes |
-| `assets/sample.bin` | 65536 | every value of a byte in order, then bytes in no order | 7 frames | 78 codes |
+| File | Bytes | What | On the page |
+| --- | --- | --- | --- |
+| `assets/sample.txt` | 3758 | text to look at once it has arrived: prose, every printable ASCII character, two lines of Chinese, numbered lines | 1 frame |
+| `assets/sample.bin` | 65536 | every value of a byte in order, then bytes in no order | 7 frames |
 
 ```sh
-qqcode-show assets/sample.txt                        # in a terminal that the camera sees
-qqcode-show assets/sample.bin --html sample.html     # or as a page for a browser
+qqcode-show assets/sample.bin --html sample.html     # a page for a browser that the camera sees
 qqcode -o read.bin --preview                         # where the camera is
 ```
 
@@ -572,10 +459,10 @@ at 15 a second.
 
 ## Tests
 
-`cargo test` needs neither a camera nor a terminal nor a browser: unit tests for the pure logic, the tests
-of `qqcode-show`, which have its screens and the frames of its page drawn as images, photographed at an
-angle and out of focus and read back as the file, and `tests/pipeline.rs`, which does the same with single
-codes and frames and runs the program `qqcode` on pictures.
+`cargo test` needs neither a camera nor a browser: unit tests for the pure logic, the tests of
+`qqcode-show`, which have the frames of its page drawn as images, photographed at an angle and out of focus
+and read back as the file, and `tests/pipeline.rs`, which does the same with single frames and runs the
+program `qqcode` on pictures.
 
 The page computes in JavaScript what the library computes in Rust, and one test has both make the tiles
 of the same frames and compares them. It runs the script of the page in `deno`; without `deno` on `PATH`

@@ -30,9 +30,8 @@ use qqcode::{Kind, Sighting, Survey};
 /// Rows below the picture: the code, the advice, the facts and the latest remark.
 const TEXT_ROWS: usize = 4;
 
-/// Colours of the marks in the picture, as blue, green, red.
+/// The colour of the mark in the picture, as blue, green, red.
 const SHOWN: (u8, u8, u8) = (0, 230, 0);
-const OTHER: (u8, u8, u8) = (255, 0, 255);
 
 /// The colour of what the lines below the picture say when no code is read.
 const NOTHING: Color = Color::Rgb { r: 255, g: 90, b: 90 };
@@ -245,8 +244,7 @@ fn picture_size(frame: Size, columns: usize, rows: usize, dot_shape: f64) -> Siz
 /// harm, and a mark for that tells whoever points the camera that something is wrong.
 fn mark_of(kind: Kind) -> Option<(u8, u8, u8)> {
     match kind {
-        Kind::Start | Kind::Piece | Kind::End => Some(SHOWN),
-        Kind::Other => Some(OTHER),
+        Kind::Start | Kind::Piece => Some(SHOWN),
         Kind::Unread => None,
     }
 }
@@ -265,13 +263,10 @@ fn picture(frame: &Mat, survey: &Survey, size: Size) -> Result<Mat> {
         size.width as f32 / frame.width as f32,
         size.height as f32 / frame.height as f32,
     );
-    // what matters most goes on last
-    let mut codes = survey
+    let codes = survey
         .codes
         .iter()
-        .filter_map(|code| Some((code, mark_of(code.kind)?)))
-        .collect::<Vec<_>>();
-    codes.sort_by_key(|(code, _)| code.kind != Kind::Other);
+        .filter_map(|code| Some((code, mark_of(code.kind)?)));
     for (code, (blue, green, red)) in codes {
         let colour = Scalar::new(blue as f64, green as f64, red as f64, 0.0);
         let outline = &code.outline;
@@ -341,9 +336,8 @@ fn status(survey: &Survey, facts: &str, remark: &str) -> Vec<Vec<(Color, String)
         None => (NOTHING, "code: -----".to_owned()),
     };
     let legend = [
-        (plain, "q quits   marks: ".to_owned()),
-        (colour(SHOWN), "code of qqcode-show  ".to_owned()),
-        (colour(OTHER), "other QR code".to_owned()),
+        (plain, "q quits   mark: ".to_owned()),
+        (colour(SHOWN), "code of qqcode-show".to_owned()),
     ];
     let remark = if remark.is_empty() {
         legend.to_vec()
@@ -358,45 +352,33 @@ fn status(survey: &Survey, facts: &str, remark: &str) -> Vec<Vec<(Color, String)
     ]
 }
 
-/// `start screen | 89 modules | 9.2 px a module`
+/// `start screen | 176 tiles across | 9.2 px a tile | 0.4 % put right`
 fn describe(code: &Sighting) -> String {
     let kind = match code.kind {
         Kind::Start => "start screen",
         Kind::Piece => "piece of the file",
-        Kind::End => "end screen",
-        Kind::Other => "not one of qqcode-show",
         Kind::Unread => "can't be read",
     };
-    match code.wrong {
-        // a matrix of tiles
-        Some(wrong) if code.kind != Kind::Unread => format!(
-            "{kind} | {} tiles across | {:.1} px a tile | {:.1} % put right",
-            code.modules,
-            code.module_size,
-            100.0 * wrong
-        ),
-        Some(_) => format!(
-            "{kind} | {} tiles across | {:.1} px a tile",
-            code.modules, code.module_size
-        ),
-        None => format!(
-            "{kind} | {} modules | {:.1} px a module",
-            code.modules, code.module_size
-        ),
+    let size = format!(
+        "{kind} | {} tiles across | {:.1} px a tile",
+        code.modules, code.module_size
+    );
+    match code.kind {
+        // nothing was put right in what was not read
+        Kind::Unread => size,
+        Kind::Start | Kind::Piece => format!("{size} | {:.1} % put right", 100.0 * code.wrong),
     }
 }
 
 /// What to do about what is in view.
 fn advice(survey: &Survey) -> &'static str {
     match survey.leading().map(|code| code.kind) {
-        Some(Kind::Start) => "start screen in view: enter in qqcode-show starts the codes",
+        Some(Kind::Start) => "start screen in view: enter on the page starts the frames",
         Some(Kind::Piece) => "a code of the file in view",
-        Some(Kind::End) => "end screen in view",
-        Some(Kind::Other) => "a QR code in view that is not one of qqcode-show",
         Some(Kind::Unread) => {
-            "a code in view that can't be read: nearer, sharper, or larger (+ in qqcode-show, a smaller --scale)"
+            "a code in view that can't be read: nearer, sharper, or larger (a smaller --scale)"
         }
-        None => "no QR code in view",
+        None => "no code in view",
     }
 }
 
@@ -414,7 +396,7 @@ mod tests {
             kind,
             modules: 89,
             module_size: side / 89.0,
-            wrong: None,
+            wrong: 0.0,
         }
     }
 
@@ -511,7 +493,6 @@ mod tests {
         let survey = Survey {
             codes: vec![
                 code(Kind::Piece, 100.0, 100.0, 400.0),
-                code(Kind::Other, 700.0, 100.0, 200.0),
                 code(Kind::Unread, 700.0, 500.0, 200.0),
             ],
         };
@@ -526,7 +507,6 @@ mod tests {
         // the code of the show, from (10, 10) to (50, 50), and nothing inside it
         assert_eq!([at(10, 10), at(30, 10), at(50, 30), at(10, 50)], [SHOWN; 4]);
         assert_eq!(at(30, 30), grey);
-        assert_eq!([at(70, 10), at(90, 20)], [OTHER; 2]);
         // the one that can't be read, from (70, 50) to (90, 70), has no outline
         assert_eq!([at(70, 50), at(80, 70), at(90, 60)], [grey; 3]);
         Ok(())
@@ -566,19 +546,22 @@ mod tests {
         let nothing = Survey::default();
         let lines = texts(&status(&nothing, "1920x1080", ""));
         assert_eq!(lines[0], "code: -----");
-        assert_eq!(lines[1], "no QR code in view");
+        assert_eq!(lines[1], "no code in view");
         assert_eq!(lines[2], "1920x1080");
         // what can't be read has no mark
-        assert_eq!(lines[3], "q quits   marks: code of qqcode-show  other QR code");
+        assert_eq!(lines[3], "q quits   mark: code of qqcode-show");
 
         let start = Survey {
             codes: vec![code(Kind::Start, 0.0, 0.0, 801.0)],
         };
         let lines = texts(&status(&start, "", "frame 12: start screen in view"));
-        assert_eq!(lines[0], "code: start screen | 89 modules | 9.0 px a module");
+        assert_eq!(
+            lines[0],
+            "code: start screen | 89 tiles across | 9.0 px a tile | 0.0 % put right"
+        );
         assert_eq!(
             lines[1],
-            "start screen in view: enter in qqcode-show starts the codes"
+            "start screen in view: enter on the page starts the frames"
         );
         assert_eq!(lines[3], "frame 12: start screen in view");
         // a code that is read and one that is not differ in colour
@@ -587,9 +570,14 @@ mod tests {
         };
         assert_ne!(status(&start, "", "")[0][0].0, status(&unread, "", "")[0][0].0);
         assert!(advice(&unread).contains("or larger"));
-        // a matrix of tiles says how much of it had to be put right
+        // and one that is not read says nothing of what was put right in it
+        assert_eq!(
+            texts(&status(&unread, "", ""))[0],
+            "code: can't be read | 89 tiles across | 3.4 px a tile"
+        );
+        // one that is read says how much of it had to be put right
         let matrix = Sighting {
-            wrong: Some(0.0123),
+            wrong: 0.0123,
             modules: 176,
             module_size: 9.04,
             ..code(Kind::Piece, 0.0, 0.0, 1591.0)
@@ -601,22 +589,14 @@ mod tests {
     }
 
     #[test]
-    fn status_goes_by_the_code_of_the_show_among_several() {
+    fn status_goes_by_the_code_that_is_read_among_several() {
         let survey = Survey {
             codes: vec![
                 code(Kind::Unread, 0.0, 0.0, 100.0),
-                code(Kind::Other, 200.0, 0.0, 100.0),
-                code(Kind::End, 400.0, 0.0, 100.0),
+                code(Kind::Piece, 400.0, 0.0, 100.0),
             ],
         };
-        assert_eq!(advice(&survey), "end screen in view");
-        let others = Survey {
-            codes: survey.codes[..2].to_vec(),
-        };
-        assert_eq!(
-            advice(&others),
-            "a QR code in view that is not one of qqcode-show"
-        );
+        assert_eq!(advice(&survey), "a code of the file in view");
         let unread = Survey {
             codes: survey.codes[..1].to_vec(),
         };
@@ -641,16 +621,18 @@ mod tests {
     }
 
     #[test]
-    fn status_describes_the_code_of_the_show_among_several() {
+    fn status_describes_the_code_that_is_read_among_several() {
         // the one that counts is not the first that was found
         let survey = Survey {
             codes: vec![
                 code(Kind::Unread, 0.0, 0.0, 100.0),
-                code(Kind::Other, 200.0, 0.0, 100.0),
-                code(Kind::End, 400.0, 0.0, 178.0),
+                code(Kind::Start, 400.0, 0.0, 178.0),
             ],
         };
         let lines = texts(&status(&survey, "", ""));
-        assert_eq!(lines[0], "code: end screen | 89 modules | 2.0 px a module");
+        assert_eq!(
+            lines[0],
+            "code: start screen | 89 tiles across | 2.0 px a tile | 0.0 % put right"
+        );
     }
 }

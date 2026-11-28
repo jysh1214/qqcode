@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use qqcode::checks::{self, Checks};
+use qqcode::crc::Checksum;
 use qqcode::digest::{self, Digests};
 use qqcode::fountain::{self, Plan, Schedule};
 use qqcode::packet::{OVERHEAD, Origin};
-use qqcode::protocol::Checksum;
 use qqcode::tiles::{self, Grid};
 #[cfg(test)]
 use qqcode::{fountain::Encoder, packet::Frame};

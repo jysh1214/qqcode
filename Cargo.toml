@@ -12,12 +12,12 @@ license = "MIT"
 publish = false
 # the package also builds `qqcode-show`, see src/bin
 default-run = "qqcode"
-description = "Carries a file from a screen to a camera as a sequence of QR codes"
+description = "Carries a file from a screen to a camera as a matrix of coloured tiles"
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-# drawing on the terminal and reading its keys
+# drawing the preview on the terminal and reading its keys
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
 # puts the standard error aside while the preview has the terminal; crossterm brings the crate along anyway
 rustix = { version = "1", default-features = false, features = ["std", "stdio"] }
@@ -31,9 +31,8 @@ opencv = { path = "third_party/opencv-rust", default-features = false, features 
     "videoio",
 ] }
 opencv-vendored = { path = "crates/opencv-vendored" }
-# makes the QR codes
-qrcode = { version = "0.15", default-features = false, features = ["std"] }
-# finds the QR codes in a frame and decodes them: of the many kinds of codes it reads, the QR reader alone
+# finds the finder patterns in a frame, which the matrix has in its corners and which are those of a QR
+# code: of the many kinds of codes it reads, the QR reader alone
 rxing = { version = "0.9", default-features = false, features = [
     "decoders",
     "encoding_rs",
@@ -42,5 +41,3 @@ rxing = { version = "0.9", default-features = false, features = [
 # the MD5 and the SHA-256 that both programs print of the file when they end
 md-5 = { version = "0.11", default-features = false }
 sha2 = { version = "0.11", default-features = false }
-# how many terminal columns a piece of text takes
-unicode-width = "0.2"

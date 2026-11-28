@@ -1,8 +1,8 @@
-//! Reads the frames of a camera that is pointed at `qqcode-show`, up to the file that is on show there.
+//! Reads the frames of a camera that is pointed at the page of `qqcode-show`, up to the file that is on
+//! show there.
 //!
-//! The show is either of two: QR codes on a terminal, each with a piece of the file and its place
-//! ([`crate::protocol`], [`crate::assembly`]), or a matrix of tiles on a web page, each frame with a packet
-//! of which any that are enough make the file ([`crate::packet`], [`crate::fountain`]).
+//! The show is a matrix of tiles on a web page, each frame with a packet of which any that are enough make
+//! the file ([`crate::packet`], [`crate::fountain`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,39 +10,29 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 use opencv::core::Mat;
 
-use crate::assembly::Assembly;
 use crate::checks::{Checks, Note};
+use crate::crc;
 use crate::fountain::Decoder;
 use crate::packet::{Frame, Origin};
-use crate::protocol::{self, Message};
-use crate::scan::{Content, Found, Outline, Scanner};
+use crate::scan::{Found, Outline, Scanner};
 use crate::stored::Stored;
 
 /// What became of one frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// Neither a QR code nor a matrix is made out
+    /// No matrix is made out
     NoCode,
-    /// There is a QR code or a matrix, which can't be read
+    /// There is a matrix, which can't be read
     Unread,
-    /// There is a QR code, which is not one of `qqcode-show`
+    /// There is a matrix, which names a file that is longer than any that is taken
     Other,
     /// The start screen of `qqcode-show`: the file is still to come
     Ready,
-    /// A QR code with a piece of the file
-    Piece {
-        /// How many of its bytes had not arrived before; none for a piece that is read again
-        new: usize,
-        /// How many bytes between the piece before and this one are missing: those went by unread
-        skipped: usize,
-    },
     /// A matrix with a packet of the file
     Packet {
         /// Whether it told anything that the packets before it had not
         new: bool,
     },
-    /// The end screen of `qqcode-show`, with parts of the file still missing
-    Done,
     /// The file is whole, [`Pipeline::take_file`] has it. What comes of the same file after it says the
     /// same.
     Complete,
@@ -57,12 +47,9 @@ pub enum Outcome {
 pub enum Kind {
     /// It can't be read
     Unread,
-    /// Not a code of `qqcode-show`
-    Other,
     Start,
-    /// A piece or a packet of the file
+    /// A packet of the file
     Piece,
-    End,
 }
 
 /// A code in a frame, for showing somebody who points a camera what it sees.
@@ -70,19 +57,12 @@ pub enum Kind {
 pub struct Sighting {
     pub outline: Outline,
     pub kind: Kind,
-    /// Modules along a side of a QR code, tiles along the longer side of a matrix
+    /// Tiles along the longer side of the matrix
     pub modules: usize,
-    /// Pixels of the frame to a module or tile
+    /// Pixels of the frame to a tile
     pub module_size: f32,
-    /// Of a matrix, the share of its bytes that were misread and put right; `None` for a QR code
-    pub wrong: Option<f32>,
-}
-
-impl Sighting {
-    /// Whether this is a matrix of tiles rather than a QR code.
-    pub fn is_matrix(&self) -> bool {
-        self.wrong.is_some()
-    }
+    /// The share of its bytes that were misread and put right
+    pub wrong: f32,
 }
 
 /// The codes that were made out in a frame.
@@ -92,13 +72,12 @@ pub struct Survey {
 }
 
 impl Survey {
-    /// The code that the frame is taken by: one of `qqcode-show` if there is one, any other one that is
-    /// decoded if not, and one that can't be decoded last.
+    /// The code that the frame is taken by: one that is read if there is one, and one that can't be
+    /// read if not.
     pub fn leading(&self) -> Option<&Sighting> {
         let rank = |sighting: &&Sighting| match sighting.kind {
-            Kind::Start | Kind::Piece | Kind::End => 0,
-            Kind::Other => 1,
-            Kind::Unread => 2,
+            Kind::Start | Kind::Piece => 0,
+            Kind::Unread => 1,
         };
         self.codes.iter().min_by_key(rank)
     }
@@ -108,17 +87,10 @@ impl Survey {
 /// not fit anywhere.
 const MAX_LENGTH: u64 = 1 << 40;
 
-/// What has arrived of the file, in the way it is shown.
+/// What has arrived of the file, where it is kept.
 enum Transfer {
-    Pieces(Assembly),
     Packets(Decoder),
     Stored(Stored),
-}
-
-/// What a code of `qqcode-show` says, in either of its two ways.
-enum Said {
-    Code(Message),
-    Matrix(Frame),
 }
 
 #[derive(Default)]
@@ -130,16 +102,13 @@ pub struct Pipeline {
     transfer: Option<Transfer>,
     /// What the start screen calls the file
     name: Option<String>,
-    /// Where the piece read last ends, or 0 after the start screen: where the next one begins if none is
-    /// left out
-    reached: Option<usize>,
     /// How many files have been begun
     files: u64,
     /// Whether the file that is on show has been put together
     whole: bool,
     file: Option<Vec<u8>>,
-    /// Where a file that a web page shows is put together on disk, and where its sums are kept
-    /// meanwhile, if it is not to be kept in memory, see [`Pipeline::storing`]
+    /// Where the file is put together on disk, and where its sums are kept meanwhile, if it is not to
+    /// be kept in memory, see [`Pipeline::storing`]
     store: Option<(PathBuf, PathBuf)>,
     /// Where it is kept which packets are in the two, see [`Pipeline::resuming`]
     index: Option<PathBuf>,
@@ -163,13 +132,12 @@ impl Pipeline {
         Self::default()
     }
 
-    /// A pipeline for files that are too long to keep in memory. The file that a web page shows is put
-    /// together in the file `part` as its frames arrive, with the help of the file `sums`
+    /// A pipeline for files that are too long to keep in memory. The file is put together in the file
+    /// `part` as its frames arrive, with the help of the file `sums`
     /// ([`crate::stored`]); both are made anew for every file that comes on show, unless what another
     /// run left of it is gone on with ([`Pipeline::resuming`]). Once the file is
     /// whole there the outcome is [`Outcome::Complete`], and it is for whoever named the two to see that
-    /// `part` has the checksum of [`Pipeline::file`] and to do away with `sums`. A file that is shown in
-    /// QR codes is short, and kept in memory as ever.
+    /// `part` has the checksum of [`Pipeline::file`] and to do away with `sums`.
     pub fn storing(part: &Path, sums: &Path) -> Self {
         Self {
             store: Some((part.to_owned(), sums.to_owned())),
@@ -205,7 +173,7 @@ impl Pipeline {
         self
     }
 
-    /// Reads one frame, in grey or with blue, green and red.
+    /// Reads one frame, with blue, green and red for every pixel: the matrix is not read from any other.
     pub fn process(&mut self, frame: &Mat) -> Result<Outcome> {
         let found = self.scanner.scan(frame)?;
         self.take(found)
@@ -217,51 +185,23 @@ impl Pipeline {
         let mut codes = Vec::with_capacity(found.len());
         let mut said = None;
         for code in found {
-            let (modules, module_size, outline) = (code.modules, code.module_size(), code.outline);
-            let (kind, wrong, says) = match code.content {
-                Content::Code(None) => (Kind::Unread, None, None),
-                Content::Code(Some(bytes)) => match Message::parse(&bytes) {
-                    None => (Kind::Other, None, None),
-                    Some(message) => {
-                        let kind = match message {
-                            Message::Start { .. } => Kind::Start,
-                            Message::Piece { .. } => Kind::Piece,
-                            Message::End { .. } => Kind::End,
-                        };
-                        (kind, None, Some(Said::Code(message)))
-                    }
-                },
-                Content::Matrix { frame: None, wrong } => (Kind::Unread, Some(wrong), None),
-                Content::Matrix {
-                    frame: Some(frame),
-                    wrong,
-                } => {
-                    let kind = match frame {
-                        Frame::Start { .. } => Kind::Start,
-                        Frame::Packet { .. } => Kind::Piece,
-                    };
-                    (kind, Some(wrong), Some(Said::Matrix(frame)))
-                }
+            let kind = match &code.frame {
+                None => Kind::Unread,
+                Some(Frame::Start { .. }) => Kind::Start,
+                Some(Frame::Packet { .. }) => Kind::Piece,
             };
             codes.push(Sighting {
-                outline,
+                outline: code.outline,
                 kind,
-                modules,
-                module_size,
-                wrong,
+                modules: code.modules,
+                module_size: code.module_size(),
+                wrong: code.wrong,
             });
             // one show at a time: the first of two is the one that counts
-            said = said.or(says);
+            said = said.or(code.frame);
         }
         self.survey = Survey { codes };
-        let on_show = match &said {
-            Some(Said::Code(message)) => Some(Origin {
-                checksum: message.file().checksum,
-                length: message.file().length as u64,
-            }),
-            Some(Said::Matrix(frame)) => Some(frame.origin()),
-            None => None,
-        };
+        let on_show = said.as_ref().map(Frame::origin);
         if let (Some(checks), Some(on_show)) = (&self.checks, on_show) {
             ensure!(
                 checks.origin == on_show,
@@ -275,13 +215,9 @@ impl Pipeline {
             );
         }
         Ok(match said {
-            Some(Said::Code(message)) => self.take_message(message),
-            Some(Said::Matrix(frame)) => self.take_frame(frame)?,
-            None => match self.survey.leading().map(|code| code.kind) {
-                Some(Kind::Unread) => Outcome::Unread,
-                Some(_) => Outcome::Other,
-                None => Outcome::NoCode,
-            },
+            Some(frame) => self.take_frame(frame)?,
+            None if self.survey.codes.is_empty() => Outcome::NoCode,
+            None => Outcome::Unread,
         })
     }
 
@@ -293,55 +229,8 @@ impl Pipeline {
             self.whole = false;
             self.transfer = None;
             self.name = None;
-            self.reached = None;
             self.kept.clear();
         }
-    }
-
-    /// Takes in what a QR code of `qqcode-show` says.
-    fn take_message(&mut self, message: Message) -> Outcome {
-        let file = message.file();
-        self.turn_to(Origin {
-            checksum: file.checksum,
-            length: file.length as u64,
-        });
-        if self.whole {
-            // nothing left to find out about this file
-            return Outcome::Complete;
-        }
-        if !matches!(self.transfer, Some(Transfer::Pieces(_))) {
-            self.transfer = Some(Transfer::Pieces(Assembly::new(file)));
-        }
-        let Some(Transfer::Pieces(assembly)) = &mut self.transfer else {
-            unreachable!("just set");
-        };
-        let outcome = match message {
-            Message::Start { name, .. } => {
-                self.name = Some(name).filter(|name| !name.is_empty());
-                self.reached = Some(0);
-                Outcome::Ready
-            }
-            Message::Piece { offset, bytes, .. } => {
-                let offset = offset as usize;
-                let skipped = match self.reached {
-                    Some(reached) if reached < offset => assembly.missing_in(reached..offset),
-                    _ => 0,
-                };
-                self.reached = Some(offset + bytes.len());
-                Outcome::Piece {
-                    new: assembly.add(offset, &bytes),
-                    skipped,
-                }
-            }
-            Message::End { .. } => Outcome::Done,
-        };
-        if !assembly.is_complete() {
-            return outcome;
-        }
-        let Some(Transfer::Pieces(assembly)) = self.transfer.take() else {
-            unreachable!("it is complete");
-        };
-        self.finish(assembly.into_bytes())
     }
 
     /// Takes in what a frame of the web page says.
@@ -380,7 +269,7 @@ impl Pipeline {
         let symbol = match &self.transfer {
             Some(Transfer::Packets(decoder)) => Some(decoder.plan().symbol),
             Some(Transfer::Stored(stored)) => Some(stored.plan().symbol),
-            _ => None,
+            None => None,
         };
         if symbol != Some(bytes.len()) {
             self.kept.clear();
@@ -412,7 +301,7 @@ impl Pipeline {
                 }
                 (taken.new, decoder.is_complete())
             }
-            _ => unreachable!("just set"),
+            None => unreachable!("just set"),
         };
         if !whole {
             return Ok(Outcome::Packet { new });
@@ -424,7 +313,7 @@ impl Pipeline {
             return Ok(Outcome::Complete);
         }
         let file = std::mem::take(&mut self.kept);
-        let checked = Some(file).filter(|bytes| protocol::checksum(bytes) == origin.checksum);
+        let checked = Some(file).filter(|bytes| crc::checksum(bytes) == origin.checksum);
         Ok(self.finish(checked))
     }
 
@@ -497,7 +386,6 @@ impl Pipeline {
     /// Ends the collecting of the file: with the file, or with nothing if its checksum is wrong or those
     /// of its sections are.
     fn finish(&mut self, file: Option<Vec<u8>>) -> Outcome {
-        self.reached = None;
         let sound = |bytes: &Vec<u8>| {
             let Some(checks) = &self.checks else {
                 return true;
@@ -526,21 +414,13 @@ impl Pipeline {
         self.file.take()
     }
 
-    /// What has arrived of a file that is shown in QR codes; `None` before its first code, once it is
-    /// whole, and for a file that is shown as a matrix.
-    pub fn assembly(&self) -> Option<&Assembly> {
-        match &self.transfer {
-            Some(Transfer::Pieces(assembly)) => Some(assembly),
-            _ => None,
-        }
-    }
-
-    /// Of a file that is shown as a matrix, how many packets have told something and how many it takes.
+    /// How many packets of the file have told something and how many it takes; `None` before its first
+    /// packet and once it is whole.
     pub fn packets(&self) -> Option<(usize, usize)> {
         match &self.transfer {
             Some(Transfer::Packets(decoder)) => Some((decoder.held(), decoder.plan().symbols())),
             Some(Transfer::Stored(stored)) => Some((stored.held(), stored.plan().symbols())),
-            _ => None,
+            None => None,
         }
     }
 
@@ -567,7 +447,6 @@ impl Pipeline {
     pub fn received(&self) -> Option<u64> {
         let file = self.current?;
         Some(match &self.transfer {
-            Some(Transfer::Pieces(assembly)) => assembly.received() as u64,
             Some(Transfer::Packets(decoder)) => decoder.received(),
             Some(Transfer::Stored(stored)) => stored.received(),
             None if self.whole => file.length,

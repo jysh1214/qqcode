@@ -16,8 +16,8 @@ only. Move it to the 4.15.0 tag once that exists.
 `crates/opencv-vendored/build.rs` runs CMake on `opencv/` and installs the result into `_install/opencv`.
 The modules to build and all CMake options are listed in that file: `core`, `imgproc`, `imgcodecs` and
 `videoio`, without CUDA and without the neural networks, which is what it takes to get frames from a camera
-or a file and to scale them for the preview. The QR codes are found and decoded by a Rust crate, not by
-OpenCV.
+or a file and to scale them for the preview. The finder patterns of the matrix are found by a Rust crate,
+not by OpenCV.
 
 The `opencv` crate generates its bindings from the installed headers, so OpenCV has to be built before that
 crate's build script runs. Cargo only orders build scripts along dependency edges, and the published crate has
