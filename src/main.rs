@@ -134,20 +134,7 @@ fn main() -> Result<()> {
         || thread::available_parallelism().map_or(1, |count| count.get().saturating_sub(1).max(1)),
         |count| count as usize,
     );
-    let scanner = Arc::new(Scanner::default());
-    let (found_by, found) = mpsc::channel();
-    for _ in 0..threads {
-        let (buffer, scanner, found_by) = (buffer.clone(), scanner.clone(), found_by.clone());
-        thread::spawn(move || {
-            while let Some((number, frame)) = buffer.take() {
-                let codes = scanner.scan(&frame);
-                if found_by.send((number, frame, codes)).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    drop(found_by);
+    let found = search(&buffer, threads, cli.preview);
 
     // A file goes into the memory until it is whole, or with -o to its place as it arrives, where what a
     // run before this one left of it is gone on with.
@@ -169,7 +156,7 @@ fn main() -> Result<()> {
     // for the preview: how fast the file arrives, and the codes that were read last
     let (mut pace, mut steady) = (Pace::default(), Steady::default());
     // what was found in frames that came back before an earlier one
-    let mut early: BTreeMap<u64, (Mat, Vec<Found>)> = BTreeMap::new();
+    let mut early: BTreeMap<u64, (Option<Mat>, Vec<Found>)> = BTreeMap::new();
     'frames: for (number, frame, codes) in found {
         early.insert(number, (frame, codes.with_context(|| format!("frame {number}"))?));
         while let Some((frame, codes)) = early.remove(&(frames + 1)) {
@@ -252,12 +239,13 @@ fn main() -> Result<()> {
             frame_at = now;
             pace.take(now, pipeline.received().unwrap_or(0));
             steady.take(pipeline.last_survey(), now);
-            // the terminal takes its time over a picture: a dozen of them a second are enough to point by
+            // The terminal takes its time over a picture: a dozen of them a second are enough to point by.
+            // The time is counted from where the picture before was done, which leaves the frames theirs
+            // on a terminal that is slower than that.
             let due = drawn_at.is_none_or(|at| at.elapsed() >= Duration::from_millis(80)) || done;
-            if let Some(preview) = &mut log.preview
+            if let (Some(preview), Some(frame)) = (&mut log.preview, &frame)
                 && due
             {
-                drawn_at = Some(Instant::now());
                 let size = frame.size()?;
                 let facts = format!(
                     "{}x{} | frame {frames} | {frame_rate:.1} frames a second | {} | {} waiting | {}",
@@ -269,7 +257,8 @@ fn main() -> Result<()> {
                 );
                 let remark = log.held.last().map_or("", String::as_str);
                 let survey = steady.show(pipeline.last_survey(), now);
-                preview.draw(&frame, survey, &facts, remark)?;
+                preview.draw(frame, survey, &facts, remark)?;
+                drawn_at = Some(Instant::now());
                 if preview.quit_requested()? {
                     log.say(format!("frame {frames}: stopped by a key"));
                     break 'frames;
@@ -582,6 +571,34 @@ fn capture_frames(
     Ok(taken)
 }
 
+/// What the threads that search the frames hand on: the number of a frame, the frame itself where it is to
+/// be shown, and what was found in it.
+type Searched = (u64, Option<Mat>, Result<Vec<Found>>);
+
+/// Starts as many threads as `threads` says, which search the frames of the buffer for codes, and returns
+/// where what they found arrives, in no order. A frame comes with it only if it is `shown`, as the preview
+/// does: it is of no other use once it is searched.
+///
+/// No more of them wait there than there are threads. Where the frames are taken in more slowly than they
+/// are searched, the threads wait, the buffer fills, and a camera drops what it takes then, as `--buffer`
+/// says: the frames are kept in the buffer and do not pile up behind it.
+fn search(buffer: &Arc<Buffer>, threads: usize, shown: bool) -> mpsc::Receiver<Searched> {
+    let scanner = Arc::new(Scanner::default());
+    let (found_by, found) = mpsc::sync_channel(threads);
+    for _ in 0..threads {
+        let (buffer, scanner, found_by) = (buffer.clone(), scanner.clone(), found_by.clone());
+        thread::spawn(move || {
+            while let Some((number, frame)) = buffer.take() {
+                let codes = scanner.scan(&frame);
+                if found_by.send((number, shown.then_some(frame), codes)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    found
+}
+
 /// The screens of `qqcode-show`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shown {
@@ -852,7 +869,7 @@ fn request_size(camera: &mut impl Camera, wanted: Size) -> Result<Size> {
 
 #[cfg(test)]
 mod tests {
-    use opencv::core::{CV_8UC1, Scalar};
+    use opencv::core::{CV_8UC1, CV_8UC3, Scalar};
 
     use super::*;
 
@@ -1013,6 +1030,47 @@ mod tests {
         ]);
         assert_eq!(request_size(&mut camera, CAMERA_SIZE)?, Size::new(1280, 720));
         assert_eq!((camera.format, camera.mode.2), (YUYV, 10.0));
+        Ok(())
+    }
+
+    #[test]
+    fn frames_that_are_searched_wait_to_be_taken_in() -> Result<()> {
+        let blank = || Mat::new_rows_cols_with_default(48, 64, CV_8UC3, Scalar::all(240.0));
+        let (threads, frames) = (2, 20);
+        let buffer = Arc::new(Buffer::new(frames));
+        for _ in 0..frames {
+            assert!(buffer.put(blank()?, false));
+        }
+        buffer.end();
+        let found = search(&buffer, threads, false);
+        // Nothing is taken in: each thread has a frame that it can't hand on, behind as many that wait
+        // for it, and the others stay in the buffer.
+        let left = frames - 2 * threads;
+        let patience = Instant::now() + Duration::from_secs(10);
+        while buffer.waiting() != left && Instant::now() < patience {
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(buffer.waiting(), left);
+        // they go on as the frames are taken in, which come without the frame where it is not shown
+        let mut numbers = Vec::new();
+        for (number, frame, codes) in found {
+            assert!(frame.is_none() && codes?.is_empty(), "frame {number}");
+            numbers.push(number);
+        }
+        numbers.sort_unstable();
+        assert_eq!(numbers, (1..=frames as u64).collect::<Vec<_>>());
+
+        // a frame that is shown comes with what was found in it
+        let buffer = Arc::new(Buffer::new(1));
+        assert!(buffer.put(blank()?, false));
+        buffer.end();
+        let shown = search(&buffer, 1, true).into_iter().collect::<Vec<_>>();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(
+            shown[0].1.as_ref().map(Mat::size).transpose()?,
+            Some(Size::new(64, 48))
+        );
         Ok(())
     }
 
