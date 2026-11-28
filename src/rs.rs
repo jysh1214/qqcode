@@ -329,4 +329,22 @@ mod tests {
         }
         assert!(noticed >= 199, "{noticed} of 200");
     }
+
+    #[test]
+    fn errors_that_look_like_one_beyond_the_word_are_noticed() {
+        // A word of 28 bytes is one of 255 that begins with zeros. Its check bytes are made those of a
+        // word with one wrong byte 100 places from its end, a place that this word has not: all eight
+        // are wrong, which is more than can be put right, and nothing in the word is the one to put right.
+        let mut random = Random(5);
+        let original = word(&mut random, 20, 8);
+        let mut far = vec![0u8; 93];
+        far[0] = 0x5a;
+        let mut received = original.clone();
+        for (byte, off) in received[20..].iter_mut().zip(encode(&far, 8)) {
+            *byte ^= off;
+        }
+        let damaged = received.clone();
+        assert_eq!(correct(&mut received, 8), None);
+        assert_eq!(received, damaged);
+    }
 }

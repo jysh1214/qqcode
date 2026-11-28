@@ -501,4 +501,13 @@ mod tests {
             "line 7 is to be a SHA-256, two spaces and 0"
         );
     }
+
+    #[test]
+    fn control_characters_beyond_ascii_are_taken_out_of_a_name_as_well() {
+        // U+009B begins a control sequence on a terminal as the escape character and a bracket do
+        let text = Checks::of("notes.txt", b"abc").to_string();
+        let text = text.replace("file notes.txt", "file a\u{9b}2Jb");
+        assert_eq!(Checks::parse(&text).unwrap().name, "a?2Jb");
+        assert_eq!(Checks::of("a\u{9b}2Jb", b"").name, "a?2Jb");
+    }
 }

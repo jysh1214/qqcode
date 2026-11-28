@@ -152,3 +152,20 @@ fn options_are_checked() {
         ("1 frame".to_owned(), "0 sections".to_owned())
     );
 }
+
+#[test]
+fn options_take_the_ends_of_their_ranges() {
+    let parse = |arguments: &[&str]| {
+        let mut command = vec!["qqcode-show", "notes.bin", "--html", "show.html"];
+        command.extend(arguments);
+        Cli::try_parse_from(command).map(|cli| (cli.scale, cli.rate, cli.spare))
+    };
+    assert_eq!(
+        parse(&["--scale", "24", "--rate", "60", "--spare", "400"]).unwrap(),
+        (24, 60, 400)
+    );
+    assert_eq!(
+        parse(&["--scale", "4", "--rate", "1", "--spare", "0"]).unwrap(),
+        (4, 1, 0)
+    );
+}

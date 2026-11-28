@@ -284,4 +284,29 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn control_characters_beyond_ascii_are_taken_out_of_a_name_as_well() {
+        // U+009B begins a control sequence on a terminal as the escape character and a bracket do, and
+        // U+0085 is a line break
+        let start = Frame::Start {
+            origin: ORIGIN,
+            name: "a\u{9b}2Jb\u{85}c".to_owned(),
+        };
+        let Some(Frame::Start { name, .. }) = Frame::parse(&start.encode(100)) else {
+            panic!("a start frame");
+        };
+        assert_eq!(name, "a?2Jb?c");
+    }
+
+    #[test]
+    #[should_panic(expected = "a frame that holds something")]
+    fn frame_without_room_for_a_byte_of_a_name_is_refused() {
+        // the header, the length of the name and the check, and nothing between them
+        Frame::Start {
+            origin: ORIGIN,
+            name: String::new(),
+        }
+        .encode(OVERHEAD + 2);
+    }
 }

@@ -884,4 +884,29 @@ mod tests {
         more[4].size = 30.0;
         assert_eq!(corners(&more).map(|corners| corners[0]), Some(more[4]));
     }
+
+    #[test]
+    fn finder_patterns_in_a_row_are_no_matrix() -> Result<()> {
+        // four of them and no four corners: the two at the ends are each the nearest to two corners of
+        // the frame
+        let row = [100.0, 300.0, 500.0, 700.0].map(|x| finder(x, 200.0));
+        assert_eq!(corners(&row), None);
+        let frame = Mat::new_rows_cols_with_default(400, 800, core::CV_8UC3, Scalar::all(0.0))?;
+        assert_eq!(read(&frame, &row, None)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn colour_that_hardly_any_tile_has_is_no_group() {
+        // Ten tiles in a hundred lack the channel: more than the twentieth at either end that may be
+        // anything, and fewer than a group is taken to have. The same of ten that have it.
+        assert_eq!(groups([vec![0.2; 10], vec![0.97; 90]].concat()), None);
+        assert_eq!(groups([vec![0.2; 90], vec![0.97; 10]].concat()), None);
+        // sixteen are a group
+        let (faint, full) = groups([vec![0.2; 16], vec![0.97; 84]].concat()).expect("two groups");
+        assert!(
+            (faint - 0.2).abs() < 0.001 && (full - 0.97).abs() < 0.001,
+            "{faint} {full}"
+        );
+    }
 }

@@ -1266,4 +1266,21 @@ mod tests {
         assert_eq!(steady.show(&other, at(700)), &other);
         assert_eq!(steady.show(&unread, at(750)), &other);
     }
+
+    #[test]
+    fn frame_that_the_buffer_has_no_room_for_is_dropped() -> Result<()> {
+        let frame = || Mat::new_rows_cols_with_default(1, 1, CV_8UC1, Scalar::all(0.0));
+        // room for two, and a camera, which does not wait for more
+        let buffer = Buffer::new(2);
+        assert!(buffer.put(frame()?, false) && buffer.put(frame()?, false));
+        assert!(!buffer.put(frame()?, false));
+        assert_eq!(buffer.waiting(), 2);
+        // the frame that was dropped has no number: the next that is put in is the third
+        assert_eq!(buffer.take().map(|(number, _)| number), Some(1));
+        assert!(buffer.put(frame()?, false));
+        assert_eq!(buffer.take().map(|(number, _)| number), Some(2));
+        assert_eq!(buffer.take().map(|(number, _)| number), Some(3));
+        assert_eq!(buffer.waiting(), 0);
+        Ok(())
+    }
 }

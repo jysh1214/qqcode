@@ -1391,3 +1391,124 @@ fn matrix_that_is_not_read_is_one_only_after_a_matrix_was_read() -> Result<()> {
     assert_eq!(pipeline.last_survey().codes.len(), 1);
     Ok(())
 }
+
+#[test]
+fn file_longer_than_any_that_is_taken_is_another_matter() -> Result<()> {
+    // a start screen is all it takes to name a file: one of 2^40 bytes is the longest that is taken
+    let start = |length: u64| Frame::Start {
+        origin: Origin { checksum: 7, length },
+        name: "disk.img".to_owned(),
+    };
+    let mut pipeline = Pipeline::new();
+    assert_eq!(pipeline.take(found(start(1 << 40)))?, Outcome::Ready);
+    assert_eq!(pipeline.file().map(|file| file.length), Some(1 << 40));
+    // a byte more and nothing is made of it: the file on show is still the one before
+    assert_eq!(pipeline.take(found(start((1 << 40) + 1)))?, Outcome::Other);
+    assert_eq!(
+        (pipeline.files(), pipeline.file().map(|file| file.length)),
+        (1, Some(1 << 40))
+    );
+    Ok(())
+}
+
+#[test]
+fn file_that_agrees_with_the_checksums_in_its_crc_alone_is_not_taken() -> Result<()> {
+    // a file is named by its length and its CRC-32 together: one that has either of them is another file
+    let file = bytes(20_000, 39);
+    let origin = Origin::of(&file);
+    let mut pipeline = Pipeline::new().checked(Checks::of("notes.bin", &file));
+    let longer = Origin {
+        length: 20_001,
+        ..origin
+    };
+    let changed = Origin {
+        checksum: origin.checksum ^ 1,
+        ..origin
+    };
+    for other in [longer, changed] {
+        let start = Frame::Start {
+            origin: other,
+            name: "notes.bin".to_owned(),
+        };
+        let error = pipeline.take(found(start)).unwrap_err().to_string();
+        let begin = format!(
+            "the file on show has {} bytes and the CRC-32 {:08x}, and the checksums are those of \"notes.bin\"",
+            other.length, other.checksum
+        );
+        assert!(error.starts_with(&begin), "{error}");
+    }
+    assert_eq!(pipeline.take(found(page_frame(&file, None)))?, Outcome::Ready);
+    Ok(())
+}
+
+#[test]
+fn program_writes_a_file_without_a_byte() -> Result<()> {
+    // whole at its start screen, which is all that the page shows of it
+    let dir = scratch("empty");
+    let input = pictures(&dir, &[], &[None])?;
+    let run = Command::new(env!("CARGO_BIN_EXE_qqcode")).arg(&input).output()?;
+    let said = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success() && run.stdout.is_empty(), "{said}");
+    assert!(said.contains("frame 1: the file is whole\n"), "{said}");
+    let end = format!(
+        " read, 0 bytes written to the standard output\nSHA-256 {}\nMD5 {}\n",
+        digest::sha256(b""),
+        digest::md5(b"")
+    );
+    assert!(said.ends_with(&end), "{said}");
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[test]
+fn program_does_not_go_on_with_a_file_that_has_not_the_sha_256_of_its_checksums() -> Result<()> {
+    // As in `program_holds_the_file_against_the_sha_256_that_its_checksums_name`, of a file that takes
+    // two runs: the first sees two of its four packets and leaves the list of them.
+    let file = bytes(20_000, 38);
+    let dir = scratch("sha-runs");
+    let input = pictures(&dir, &file, &[None, Some(0), Some(1), Some(2), Some(3)])?;
+    let first = dir.join("first");
+    fs::create_dir_all(&first)?;
+    for frame in 0..3 {
+        let name = format!("frame_{frame:03}.png");
+        fs::copy(dir.join(&name), first.join(&name))?;
+    }
+    let right = Checks::of("notes.bin", &file);
+    let text = right.to_string().replace(
+        &format!("sha256 {}", right.sha256),
+        &format!("sha256 {}", digest::sha256(b"another file")),
+    );
+    let list = dir.join("notes.bin.checksums.txt");
+    fs::write(&list, &text)?;
+    let (output, part) = (dir.join("read.bin"), dir.join("read.bin.part"));
+    let index = dir.join("read.bin.part.index");
+    let run = |input: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_qqcode"))
+            .arg(input)
+            .arg("-o")
+            .arg(&output)
+            .arg("--check")
+            .arg(&list)
+            .output()
+    };
+    let stopped = run(&first.join("frame_%03d.png"))?;
+    let said = String::from_utf8_lossy(&stopped.stderr);
+    assert!(
+        said.contains("2 of the 4 packets it takes have arrived; they are kept in"),
+        "{said}"
+    );
+    assert!(index.exists());
+    // The second run goes on with them, and the file that is whole then is not the one that the list
+    // names. Nothing says which of its packets to read again, so the list of what arrived is gone, and
+    // the run after this one begins the file anew.
+    let whole = run(&input)?;
+    let said = String::from_utf8_lossy(&whole.stderr);
+    assert!(
+        said.contains("going on with") && said.contains("has not the SHA-256 that its checksums name"),
+        "{said}"
+    );
+    assert!(!whole.status.success() && !output.exists() && part.exists());
+    assert!(!index.exists(), "the index of a file that is whole and wrong");
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}

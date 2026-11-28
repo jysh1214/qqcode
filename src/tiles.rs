@@ -539,4 +539,14 @@ mod tests {
         tiles.truncate(tiles.len() - 2);
         assert_eq!(unpack(grid, &tiles), None);
     }
+
+    #[test]
+    fn planes_that_are_a_whole_number_of_words_have_no_word_more() {
+        // 256 by 144 tiles less the corners: 18360 bytes of symbols, which are 72 words of 255 bytes, and
+        // 9180 bytes of colours, which are 36
+        let grid = Grid::new(Shape::Wide, 16);
+        let (symbols, colours) = grid.planes();
+        assert_eq!((symbols.words(), colours.words()), (vec![255; 72], vec![255; 36]));
+        assert_eq!(grid.capacity(), 18360 - 72 * 64 + 9180 - 36 * 40);
+    }
 }

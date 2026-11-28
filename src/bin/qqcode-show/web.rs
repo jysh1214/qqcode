@@ -666,4 +666,47 @@ mod tests {
         assert_eq!(md5, qqcode::digest::md5(&long));
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn name_does_not_end_a_line_of_the_script_it_stands_in() {
+        // the line and the paragraph separator, which end a line in a script and not in JSON
+        assert_eq!(json("a\u{2028}b\u{2029}"), "a\\u2028b\\u2029");
+    }
+
+    #[test]
+    fn bytes_of_an_address_are_two_digits_each() {
+        // a tab and a line break in the name of a page
+        assert_eq!(
+            address(Path::new("/tmp/a\tb\n.html")),
+            "file:///tmp/a%09b%0A.html"
+        );
+    }
+
+    #[test]
+    fn time_is_said_in_minutes_from_two_of_them_on() {
+        assert_eq!(
+            [span(0), span(119), span(120), span(121)],
+            ["0 s", "119 s", "2 min 0 s", "2 min 1 s"]
+        );
+    }
+
+    #[test]
+    fn summary_of_a_short_file_that_the_page_asks_for_says_no_more_than_the_file() {
+        // three megabytes, far less than the 83 that a group of blocks comes to
+        let origin = Origin {
+            checksum: 1,
+            length: 3_000_000,
+        };
+        let text = summary(
+            Path::new("show.html"),
+            "notes.bin",
+            origin,
+            false,
+            format(Shape::Wide, 11),
+        );
+        assert!(
+            text.contains("; the page asks for the file when it is opened, and reads it 3 MB at a time\n"),
+            "{text}"
+        );
+    }
 }
