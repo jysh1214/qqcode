@@ -113,7 +113,7 @@ fn main() -> Result<()> {
     };
     let sections = checks.as_ref().map(Checks::sections);
     let sha256 = checks.as_ref().map(|checks| checks.sha256.clone());
-    let capture = open(&cli.input, cli.camera_size)?;
+    let mut capture = open(&cli.input, cli.camera_size)?;
     // a camera goes on whatever becomes of its frames, a file can wait
     let live = cli.input.parse::<i32>().is_ok();
     let mut log = Log {
@@ -128,7 +128,7 @@ fn main() -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let camera = {
         let (buffer, dropped, stop) = (buffer.clone(), dropped.clone(), stop.clone());
-        thread::spawn(move || capture_frames(capture, &buffer, live, &dropped, &stop))
+        thread::spawn(move || capture_frames(&mut capture, &buffer, live, &dropped, &stop))
     };
     let threads = cli.threads.map_or_else(
         || thread::available_parallelism().map_or(1, |count| count.get().saturating_sub(1).max(1)),
@@ -285,9 +285,11 @@ fn main() -> Result<()> {
     // nothing more is wanted of the camera or of the frames that wait
     stop.store(true, Ordering::Relaxed);
     buffer.close();
+    // an error of the camera's ends the run only below, where it is not in the way of a file that is whole
     let taken = camera
         .join()
-        .map_err(|_| anyhow::anyhow!("the camera's thread failed"))??;
+        .map_err(|_| anyhow!("the camera's thread failed"))
+        .flatten();
     // the terminal comes back before anything else is said
     log.close();
 
@@ -300,6 +302,9 @@ fn main() -> Result<()> {
         );
     }
     if done {
+        if let Err(error) = &taken {
+            eprintln!("the camera failed after the frames that made the file: {error:#}");
+        }
         let origin = pipeline.file().context("a file that is whole has a name")?;
         let (written, to, digests) = match store {
             Some(store) => {
@@ -336,7 +341,7 @@ fn main() -> Result<()> {
         eprintln!("MD5 {}", digests.1);
         return Ok(());
     }
-    if taken == 0 {
+    if taken? == 0 {
         bail!("no frame could be read from {}", cli.input);
     }
     eprintln!("{frames} frames read, nothing written");
@@ -515,27 +520,65 @@ impl Buffer {
     }
 }
 
-/// Puts the frames of a camera or file into the buffer until they end or `stop` says so. Returns how many
-/// frames there were.
+/// Where the frames come from. A trait, so that the taking of them can be tested without a camera.
+trait Frames {
+    /// The next frame, or `None` where there is none: a file has ended there, and a camera has missed a
+    /// frame, which says nothing of the ones after it.
+    fn next_frame(&mut self) -> Result<Option<Mat>>;
+}
+
+impl Frames for videoio::VideoCapture {
+    fn next_frame(&mut self) -> Result<Option<Mat>> {
+        let mut frame = Mat::default();
+        Ok((self.read(&mut frame)? && !frame.empty()).then_some(frame))
+    }
+}
+
+/// How many times in a row a camera may have no frame before it is taken to have none any more, and how
+/// long it is left alone after each of them.
+const CAMERA_MISSES: u32 = 5;
+const CAMERA_PAUSE: Duration = Duration::from_millis(100);
+
+/// Ends a buffer when it is dropped: however the taking of the frames ends, with an error as well, the
+/// threads that wait for more of them are told that none come.
+struct Ending<'a>(&'a Buffer);
+
+impl Drop for Ending<'_> {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
+/// Puts the frames of a camera or file into the buffer until they end or `stop` says so, and ends the
+/// buffer. Returns how many frames there were.
+///
+/// A file ends where it has no frame. A camera that has none has missed one, or one came through the cable
+/// damaged, and is asked for the next: only [`CAMERA_MISSES`] of them in a row are the end of it, and what
+/// has arrived of a file is not lost to one of them.
 fn capture_frames(
-    mut capture: videoio::VideoCapture,
+    source: &mut impl Frames,
     buffer: &Buffer,
     live: bool,
     dropped: &AtomicU64,
     stop: &AtomicBool,
 ) -> Result<u64> {
-    let mut taken = 0;
+    let _ending = Ending(buffer);
+    let (mut taken, mut missed) = (0, 0);
     while !stop.load(Ordering::Relaxed) {
-        let mut frame = Mat::default();
-        if !capture.read(&mut frame)? || frame.empty() {
-            break;
-        }
+        let Some(frame) = source.next_frame()? else {
+            missed += 1;
+            if !live || missed == CAMERA_MISSES {
+                break;
+            }
+            thread::sleep(CAMERA_PAUSE);
+            continue;
+        };
+        missed = 0;
         taken += 1;
         if !buffer.put(frame, !live) && !stop.load(Ordering::Relaxed) {
             dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
-    buffer.end();
     Ok(taken)
 }
 
@@ -807,6 +850,8 @@ fn request_size(camera: &mut impl Camera, wanted: Size) -> Result<Size> {
 
 #[cfg(test)]
 mod tests {
+    use opencv::core::{CV_8UC1, Scalar};
+
     use super::*;
 
     const WIDTH: i32 = videoio::CAP_PROP_FRAME_WIDTH;
@@ -967,6 +1012,62 @@ mod tests {
             Size::new(1920, 1080)
         );
         Ok(())
+    }
+
+    /// A camera or file that has the frames of a list, `Ok(false)` being one that it has not, and none
+    /// after the last. It counts how often it is asked.
+    struct Listed {
+        frames: VecDeque<Result<bool>>,
+        asked: u32,
+    }
+
+    impl Listed {
+        fn new(frames: impl IntoIterator<Item = Result<bool>>) -> Self {
+            Self {
+                frames: frames.into_iter().collect(),
+                asked: 0,
+            }
+        }
+    }
+
+    impl Frames for Listed {
+        fn next_frame(&mut self) -> Result<Option<Mat>> {
+            self.asked += 1;
+            Ok(match self.frames.pop_front().transpose()? {
+                Some(true) => Some(Mat::new_rows_cols_with_default(1, 1, CV_8UC1, Scalar::all(0.0))?),
+                _ => None,
+            })
+        }
+    }
+
+    #[test]
+    fn camera_that_misses_frames_is_asked_for_the_next_and_a_file_has_ended() -> Result<()> {
+        let listed = || Listed::new([Ok(true), Ok(false), Ok(false), Ok(true)]);
+        let (dropped, stop) = (AtomicU64::new(0), AtomicBool::new(false));
+        // a camera goes on after the two frames that it has not, until it has none time after time
+        let (mut camera, buffer) = (listed(), Buffer::new(8));
+        assert_eq!(capture_frames(&mut camera, &buffer, true, &dropped, &stop)?, 2);
+        assert_eq!(camera.asked, 4 + CAMERA_MISSES);
+        assert_eq!((buffer.waiting(), buffer.state().closed), (2, true));
+        // a file is asked no more where it has none
+        let (mut file, buffer) = (listed(), Buffer::new(8));
+        assert_eq!(capture_frames(&mut file, &buffer, false, &dropped, &stop)?, 1);
+        assert_eq!(file.asked, 2);
+        assert_eq!((buffer.waiting(), buffer.state().closed), (1, true));
+        Ok(())
+    }
+
+    #[test]
+    fn error_of_the_camera_ends_the_buffer() {
+        let mut camera = Listed::new([Ok(true), Err(anyhow!("unplugged")), Ok(true)]);
+        let (buffer, dropped, stop) = (Buffer::new(8), AtomicU64::new(0), AtomicBool::new(false));
+        let error = capture_frames(&mut camera, &buffer, true, &dropped, &stop).unwrap_err();
+        assert_eq!((error.to_string().as_str(), camera.asked), ("unplugged", 2));
+        // or the threads that search the frames would wait for more of them without end; the frame
+        // before the error is theirs still
+        assert!(buffer.state().closed);
+        assert_eq!(buffer.take().map(|(number, _)| number), Some(1));
+        assert!(buffer.take().is_none());
     }
 
     #[test]
