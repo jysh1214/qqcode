@@ -36,23 +36,26 @@ Environment variables read by the OpenCV build:
 
 ## Usage
 
+The examples show and read the two files in `assets/`: `sample.txt`, 3758 bytes of text, and `sample.bin`,
+65536 bytes.
+
 ```sh
-qqcode > <file>                                  # camera 0
-qqcode 2 -o <file> --preview                     # camera 2, with a view of what it sees
-qqcode -o <file> --check <file>.checksums.txt    # held against the checksums from qqcode-show
-qqcode --threads 4 --buffer 64 > <file>          # on a machine with little memory
-qqcode --camera-size 1280x720 > <file>           # smaller frames
-qqcode recording.mp4 > <file>                    # a video of the show instead of a camera
-qqcode 'frame_%04d.png' > <file>                 # or pictures of it
+qqcode > sample.txt                                      # camera 0
+qqcode 2 -o sample.bin --preview                         # camera 2, with a view of what it sees
+qqcode -o sample.bin --check sample.bin.checksums.txt    # held against the checksums from qqcode-show
+qqcode --threads 4 --buffer 64 > sample.bin              # on a machine with little memory
+qqcode --camera-size 1280x720 > sample.bin               # smaller frames
+qqcode recording.mp4 > sample.bin                        # a video of the show instead of a camera
+qqcode 'frame_%04d.png' > sample.bin                     # or pictures of it
 ```
 
-- The file goes to the standard output, or to `-o <file>`. Nothing of it is written before it is whole and
-  its checksum is right.
-- With `-o` the file is put together on disk as it arrives, in `<file>.part`, which a file that is larger
-  than the memory needs. A run that is stopped leaves that where it is, and the same command goes on with
-  it.
-- `--check <file>.checksums.txt` holds the file against the checksums that `qqcode-show` writes next to its
-  page, megabyte by megabyte.
+- The file goes to the standard output, or to the file that `-o` names. Nothing of it is written before it
+  is whole and its checksum is right.
+- With `-o sample.bin` the file is put together on disk as it arrives, in `sample.bin.part`, which a file
+  that is larger than the memory needs. A run that is stopped leaves that where it is, and the same command
+  goes on with it.
+- `--check sample.bin.checksums.txt` holds the file against the checksums that `qqcode-show` writes next to
+  its page, megabyte by megabyte.
 - `--preview` shows what the camera sees, for pointing it, with the pixels that a tile gets and how fast
   the file arrives; `q` quits.
 
@@ -61,10 +64,10 @@ qqcode 'frame_%04d.png' > <file>                 # or pictures of it
 ## The web page
 
 ```sh
-qqcode-show <file> --html show.html                       # 176x99 tiles, 15 frames a second
-qqcode-show <file> --html show.html --scale 16 --rate 12  # more tiles, for a sharp camera
-qqcode-show <file> --html show.html --shape classic       # for a camera with frames of 4:3
-qqcode-show <file>.checksums.txt --html list.html         # the checksums, to go ahead of the file
+qqcode-show assets/sample.txt --html show.html                       # 176x99 tiles, 15 frames a second
+qqcode-show assets/sample.bin --html show.html --scale 16 --rate 12  # more tiles, for a sharp camera
+qqcode-show assets/sample.bin --html show.html --shape classic       # for a camera with frames of 4:3
+qqcode-show sample.bin.checksums.txt --html list.html                # the checksums, to go ahead of the file
 ```
 
 The page shows a matrix of coloured tiles, frame after frame without end: 10 kB of the file in a frame and
@@ -75,10 +78,10 @@ nothing. The matrix is best shown filling the frames of the camera; where frames
 Keys on the page: `enter` or `space` start and pause, `+` and `-` change the frames a second, `g` goes back
 to the start screen, `f` takes the whole screen, `h` hides the notes.
 
-Next to the page `qqcode-show` writes `<file>.checksums.txt`, for `qqcode --check`. That list has to be
-where the camera is before the file, and it is a file like any other, so it can go the same way first. A
-page holds the file that it shows up to 64 MB; the page of a longer file asks for the file when it is
-opened.
+Next to the page `qqcode-show` writes the checksums of the file, `sample.bin.checksums.txt` for
+`assets/sample.bin`, for `qqcode --check`. That list has to be where the camera is before the file, and it is
+a file like any other, so it can go the same way first. A page holds the file that it shows up to 64 MB; the
+page of a longer file asks for the file when it is opened.
 
 `qqcode-show --help` lists every option.
 
